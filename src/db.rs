@@ -19,9 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// SQLite busy_timeout: how long a blocked writer waits for the write lock
-/// before returning SQLITE_BUSY. Replaces the per-process retry/backoff used
-/// with redb's exclusive file lock.
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// before returning SQLITE_BUSY. Set high enough to survive burst contention
+/// from concurrent CLI processes (e.g., 20 VMs starting simultaneously).
+const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Extension trait to convert errors into `Error::database`.
 trait DbResultExt<T> {

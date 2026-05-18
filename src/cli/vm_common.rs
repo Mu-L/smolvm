@@ -756,14 +756,30 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     }
 
-    // Persist running state after output — 1 write cycle (not on critical path)
+    // Persist running state with retries for SQLite contention under burst starts.
     let pid_start_time = pid.and_then(smolvm::process::process_start_time);
-    if let Err(e) = db.update_vm(name, |r| {
-        r.state = RecordState::Running;
-        r.pid = pid;
-        r.pid_start_time = pid_start_time;
-    }) {
-        tracing::warn!(error = %e, vm = %name, "failed to persist running state");
+    let mut persist_ok = false;
+    for attempt in 0..5 {
+        match db.update_vm(name, |r| {
+            r.state = RecordState::Running;
+            r.pid = pid;
+            r.pid_start_time = pid_start_time;
+        }) {
+            Ok(_) => {
+                persist_ok = true;
+                break;
+            }
+            Err(e) => {
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(100 * (1 << attempt)));
+                } else {
+                    tracing::warn!(error = %e, vm = %name, "failed to persist running state after retries");
+                }
+            }
+        }
+    }
+    if !persist_ok {
+        tracing::warn!(vm = %name, "VM is running but state may not be persisted in database");
     }
 
     // Keep VM running (persistent)
