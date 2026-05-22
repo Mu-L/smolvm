@@ -425,8 +425,8 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 2)]
     pub overlay_gb: Option<u64>,
-    /// Creation timestamp.
-    pub created_at: String,
+    /// Creation timestamp (seconds since Unix epoch).
+    pub created_at: u64,
 }
 
 /// List machines response.

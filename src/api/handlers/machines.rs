@@ -97,7 +97,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         network: record.network,
         storage_gb: record.storage_gb,
         overlay_gb: record.overlay_gb,
-        created_at: record.created_at.clone(),
+        created_at: record.created_at,
     }
 }
 
@@ -905,7 +905,7 @@ mod tests {
         assert_eq!(info.ports.len(), 0);
         assert!(!info.network);
         assert!(info.pid.is_none());
-        assert!(!info.created_at.is_empty());
+        assert!(info.created_at > 0);
     }
 
     #[test]

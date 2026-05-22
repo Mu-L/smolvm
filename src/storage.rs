@@ -51,7 +51,7 @@ impl DiskVersion {
     pub fn new(base_digest: impl Into<String>) -> Self {
         Self {
             format_version: Self::CURRENT_VERSION,
-            created_at: crate::util::current_timestamp(),
+            created_at: crate::util::current_timestamp().to_string(),
             base_digest: base_digest.into(),
             smolvm_version: env!("CARGO_PKG_VERSION").to_string(),
         }

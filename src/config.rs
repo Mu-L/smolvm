@@ -329,8 +329,9 @@ pub struct VmRecord {
     /// VM name/ID.
     pub name: String,
 
-    /// Creation timestamp.
-    pub created_at: String,
+    /// Creation timestamp (seconds since Unix epoch).
+    #[serde(deserialize_with = "deserialize_timestamp", default)]
+    pub created_at: u64,
 
     /// VM lifecycle state.
     #[serde(default)]
@@ -470,6 +471,25 @@ pub struct VmRecord {
     /// them via virtiofs instead of pulling the image from a registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_smolmachine: Option<String>,
+}
+
+/// Deserialize `created_at` from either a legacy JSON string `"1705312345"` or
+/// the current integer `1705312345`. Old DB records stored it as a string.
+fn deserialize_timestamp<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StrOrU64 {
+        Str(String),
+        U64(u64),
+    }
+    match StrOrU64::deserialize(deserializer)? {
+        StrOrU64::U64(n) => Ok(n),
+        StrOrU64::Str(s) => s.parse::<u64>().map_err(serde::de::Error::custom),
+    }
 }
 
 fn default_cpus() -> u8 {

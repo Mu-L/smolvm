@@ -838,7 +838,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         network: entry.network,
         storage_gb: entry.resources.storage_gb,
         overlay_gb: entry.resources.overlay_gb,
-        created_at: String::new(),
+        created_at: 0,
     }
 }
 
