@@ -3436,7 +3436,7 @@ fn run_interactive_loop(
                 &mut stdout_buf,
                 &mut stderr_buf,
             )?;
-            return Ok(status.code().unwrap_or(-1));
+            return Ok(process::exit_code_from_status(&status));
         }
 
         // Check timeout
@@ -3651,7 +3651,7 @@ fn run_interactive_loop_pty(
                     Err(_) => break,
                 }
             }
-            return Ok(status.code().unwrap_or(-1));
+            return Ok(process::exit_code_from_status(&status));
         }
 
         // Check timeout.
@@ -3743,7 +3743,7 @@ fn run_interactive_loop_pty(
         // If the slave closed, the process is exiting — reap it now.
         if slave_closed {
             let status = child.wait()?;
-            return Ok(status.code().unwrap_or(-1));
+            return Ok(process::exit_code_from_status(&status));
         }
 
         // Read incoming request from host — only when poll confirms data
@@ -4577,7 +4577,7 @@ fn handle_vm_exec(
 
     let exit_code = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status.code().unwrap_or(-1),
+            Ok(Some(status)) => break process::exit_code_from_status(&status),
             Ok(None) => {
                 // Client disconnected — kill the orphan child so the accept
                 // loop isn't blocked waiting for it. Fixes BUG-12/20: SIGTERM
