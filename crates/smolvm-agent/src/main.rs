@@ -445,6 +445,25 @@ impl MountEntry {
 /// Uses direct syscalls to avoid any overhead.
 #[cfg(target_os = "linux")]
 fn mount_essential_filesystems() {
+    // The guest root filesystem is read-only, and neither libkrun's init.c nor
+    // the kernel mounts /tmp. A writable /tmp is the idiomatic home for
+    // ephemeral runtime files (the registry-auth config, crun console sockets,
+    // the ssh-agent socket, …), so mount a tmpfs over it. Best-effort: a
+    // failure here must not abort boot, and the individual writers that target
+    // /storage still work without it. Runs unconditionally — before the
+    // init.c-already-mounted early return below — because init.c never mounts
+    // /tmp.
+    let tmp = MountEntry {
+        source: "tmpfs",
+        target: "/tmp",
+        fstype: "tmpfs",
+        flags: libc::MS_NOSUID | libc::MS_NODEV,
+        data: Some("mode=1777"),
+    };
+    if let Err(e) = tmp.mount() {
+        warn!("smolvm-agent: failed to mount tmpfs on /tmp: {}", e);
+    }
+
     // libkrun's init.c mounts /proc, /sys, /dev, /dev/pts before exec'ing
     // the agent. Skip redundant mounts if already present.
     if std::path::Path::new("/proc/uptime").exists() {
