@@ -8,7 +8,13 @@ use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+/// Monotonic counter making each console-socket path unique, so concurrent
+/// sessions that share a container id (e.g. multiple `crun exec` into one
+/// running container) never collide on the same socket file.
+static CONSOLE_SOCKET_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// RAII wrapper around the master side of a PTY pair.
 ///
@@ -92,21 +98,23 @@ pub struct ConsoleSocket {
 }
 
 impl ConsoleSocket {
-    /// Bind a uniquely-named console socket. `tag` (e.g. the container id) keeps
-    /// concurrent sessions from colliding; only its tail is used to stay within
-    /// the ~108-byte AF_UNIX path limit.
+    /// Bind a uniquely-named console socket. `tag` (e.g. the container id) is a
+    /// human-readable hint; a process-global sequence number guarantees
+    /// uniqueness so concurrent sessions sharing a container id (multiple
+    /// `crun exec` into one container) never collide. Only the tag's tail is
+    /// used, to stay within the ~108-byte AF_UNIX path limit.
     pub fn bind(tag: &str) -> io::Result<Self> {
         let tail: String = {
             let s = tag.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-            let start = s.len().saturating_sub(24);
+            let start = s.len().saturating_sub(16);
             s[start..].to_string()
         };
+        let seq = CONSOLE_SOCKET_SEQ.fetch_add(1, Ordering::Relaxed);
         // The guest root filesystem (and thus /tmp) is read-only, so bind the
         // socket under the writable storage disk. crun shares this mount
-        // namespace, so it can connect to the same path. Kept short to stay
-        // within the ~108-byte AF_UNIX path limit.
+        // namespace, so it can connect to the same path.
         let dir = Path::new(crate::paths::STORAGE_ROOT);
-        let path = dir.join(format!("smolvm-con-{}.sock", tail));
+        let path = dir.join(format!("smolvm-con-{}-{}.sock", tail, seq));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path)?;
         Ok(Self { path, listener })
