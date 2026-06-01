@@ -240,17 +240,6 @@ impl CrunCommand {
         c
     }
 
-    /// Pass `--console-socket <path>` to the crun subcommand.
-    ///
-    /// With `process.terminal = true` in the OCI spec, crun will connect to
-    /// this AF_UNIX socket and send the container's PTY master fd via
-    /// `SCM_RIGHTS`. The caller must be listening on `path` before the crun
-    /// process starts.
-    pub fn console_socket(mut self, path: &Path) -> Self {
-        self.cmd.args(["--console-socket", &path.to_string_lossy()]);
-        self
-    }
-
     /// Set stdin to null.
     pub fn stdin_null(mut self) -> Self {
         self.cmd.stdin(Stdio::null());
@@ -260,6 +249,39 @@ impl CrunCommand {
     /// Set stdin to piped.
     pub fn stdin_piped(mut self) -> Self {
         self.cmd.stdin(Stdio::piped());
+        self
+    }
+
+    /// Set stdin from a raw fd (e.g., PTY slave).
+    ///
+    /// # Safety
+    /// The fd must be a valid open file descriptor. Ownership is transferred.
+    #[cfg(unix)]
+    pub unsafe fn stdin_from_fd(mut self, fd: std::os::unix::io::RawFd) -> Self {
+        use std::os::unix::io::FromRawFd;
+        self.cmd.stdin(Stdio::from_raw_fd(fd));
+        self
+    }
+
+    /// Set stdout from a raw fd (e.g., PTY slave).
+    ///
+    /// # Safety
+    /// The fd must be a valid open file descriptor. Ownership is transferred.
+    #[cfg(unix)]
+    pub unsafe fn stdout_from_fd(mut self, fd: std::os::unix::io::RawFd) -> Self {
+        use std::os::unix::io::FromRawFd;
+        self.cmd.stdout(Stdio::from_raw_fd(fd));
+        self
+    }
+
+    /// Set stderr from a raw fd (e.g., PTY slave).
+    ///
+    /// # Safety
+    /// The fd must be a valid open file descriptor. Ownership is transferred.
+    #[cfg(unix)]
+    pub unsafe fn stderr_from_fd(mut self, fd: std::os::unix::io::RawFd) -> Self {
+        use std::os::unix::io::FromRawFd;
+        self.cmd.stderr(Stdio::from_raw_fd(fd));
         self
     }
 

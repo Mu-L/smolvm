@@ -404,7 +404,8 @@ pub async fn exec_interactive(
         // Input channel: WS task → blocking session (sync mpsc; session try_recv's it).
         let (in_tx, in_rx) = std::sync::mpsc::channel::<crate::agent::InteractiveInput>();
         // Output channel: blocking session → WS task (tokio mpsc; blocking_send from session).
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<crate::agent::InteractiveOutput>(256);
+        let (out_tx, mut out_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::InteractiveOutput>(256);
 
         // Seed the initial PTY size before any input.
         let _ = in_tx.send(crate::agent::InteractiveInput::Resize {
@@ -452,10 +453,12 @@ pub async fn exec_interactive(
                         .with_mounts(mounts_config)
                         .with_tty(true)
                         .with_persistent_overlay(Some(id));
-                    client.run_interactive_io(config, in_rx, on_output).unwrap_or_else(|e| {
-                        tracing::warn!(error = ?e, "pty: interactive run failed");
-                        -1
-                    })
+                    client
+                        .run_interactive_io(config, in_rx, on_output)
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(error = ?e, "pty: interactive run failed");
+                            -1
+                        })
                 } else {
                     client
                         .vm_exec_interactive_io(command, Vec::new(), None, true, in_rx, on_output)

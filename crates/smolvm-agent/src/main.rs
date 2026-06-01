@@ -18,10 +18,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use tracing::{debug, error, info, warn};
 
-// console_socket depends on the Linux-only `pty` module and is only used by the
-// crun console-socket handshake, which itself only runs on Linux.
-#[cfg(target_os = "linux")]
-mod console_socket;
 mod crun;
 
 /// Ensures storage disk is mounted exactly once. The mount happens either during
@@ -2764,11 +2760,6 @@ fn handle_interactive_run(
     Ok(())
 }
 
-/// How long the agent waits for crun to connect to the console socket
-/// and hand over the container PTY master fd before giving up.
-#[cfg(target_os = "linux")]
-const CONSOLE_SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// Resolve the command for a container run.
 ///
 /// If the caller supplied a command, use it verbatim. Otherwise fall back to
@@ -3296,6 +3287,16 @@ pub fn resolve_main_container(persistent_overlay_id: Option<&str>) -> Option<Str
 pub fn resolve_main_container(_persistent_overlay_id: Option<&str>) -> Option<String> {
     None
 }
+
+/// Whether the runtime's `--console-socket` handshake works in this environment.
+/// We attempt it once; if the runtime never hands back the console master (older
+/// crun, or a guest where it doesn't work), we flip this off and use the
+/// stdio-PTY fallback for the rest of the process's life — so only the first
+/// interactive session pays the connect timeout. The console path gives dynamic
+/// terminal resize; the fallback works everywhere but doesn't propagate resize.
+#[cfg(target_os = "linux")]
+static CONSOLE_SOCKET_WORKS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
 
 /// Spawn a command for interactive execution using crun OCI runtime.
 ///

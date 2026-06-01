@@ -39,7 +39,12 @@ pub enum InteractiveInput {
     /// Bytes to forward to the command's stdin.
     Stdin(Vec<u8>),
     /// Terminal resize (PTY window change).
-    Resize { cols: u16, rows: u16 },
+    Resize {
+        /// New terminal width in columns.
+        cols: u16,
+        /// New terminal height in rows.
+        rows: u16,
+    },
     /// End of input — sends an empty stdin frame (EOF) to the command.
     Eof,
 }
@@ -47,7 +52,9 @@ pub enum InteractiveInput {
 /// One output chunk produced by a channel-driven interactive session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InteractiveOutput {
+    /// A chunk of bytes from the command's stdout.
     Stdout(Vec<u8>),
+    /// A chunk of bytes from the command's stderr.
     Stderr(Vec<u8>),
 }
 
@@ -1331,14 +1338,23 @@ impl AgentClient {
             // Drain agent output first (prevents deadlock when its send buffer fills).
             if poll_result.socket_ready {
                 match self.receive() {
-                    Ok(AgentResponse::Stdout { data }) => on_output(InteractiveOutput::Stdout(data)),
-                    Ok(AgentResponse::Stderr { data }) => on_output(InteractiveOutput::Stderr(data)),
+                    Ok(AgentResponse::Stdout { data }) => {
+                        on_output(InteractiveOutput::Stdout(data))
+                    }
+                    Ok(AgentResponse::Stderr { data }) => {
+                        on_output(InteractiveOutput::Stderr(data))
+                    }
                     Ok(AgentResponse::Exited { exit_code }) => break exit_code,
-                    Ok(AgentResponse::Error { message, .. }) => return Err(Error::agent(op, message)),
+                    Ok(AgentResponse::Error { message, .. }) => {
+                        return Err(Error::agent(op, message))
+                    }
                     Ok(_) => {}
                     Err(e) => {
                         if e.is_io()
-                            && matches!(e.source_io_error_kind(), Some(std::io::ErrorKind::WouldBlock))
+                            && matches!(
+                                e.source_io_error_kind(),
+                                Some(std::io::ErrorKind::WouldBlock)
+                            )
                         {
                             continue;
                         }
@@ -1354,7 +1370,9 @@ impl AgentClient {
             // Forward any pending input without blocking the output path.
             loop {
                 match input.try_recv() {
-                    Ok(InteractiveInput::Stdin(data)) => self.send(&AgentRequest::Stdin { data })?,
+                    Ok(InteractiveInput::Stdin(data)) => {
+                        self.send(&AgentRequest::Stdin { data })?
+                    }
                     Ok(InteractiveInput::Resize { cols, rows }) => {
                         self.send(&AgentRequest::Resize { cols, rows })?
                     }
