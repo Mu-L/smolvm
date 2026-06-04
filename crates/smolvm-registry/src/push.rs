@@ -118,8 +118,12 @@ pub async fn push(
     let platform = OciPlatform::parse(&manifest.host_platform);
     let platform_tag = format!("{reference}-{}-{}", platform.os, platform.architecture);
     tracing::info!(digest = %manifest_digest, platform = %platform.label(), "uploading manifest...");
-    client.put_manifest(repo, &manifest_digest, &manifest_json).await?;
-    client.put_manifest(repo, &platform_tag, &manifest_json).await?;
+    client
+        .put_manifest(repo, &manifest_digest, &manifest_json)
+        .await?;
+    client
+        .put_manifest(repo, &platform_tag, &manifest_json)
+        .await?;
 
     // 7. Maintain an image index at `reference` so the tag fans out by platform.
     //    Merge with any existing index (replacing this platform's entry); a
@@ -131,9 +135,11 @@ pub async fn push(
         platform: Some(platform.clone()),
     };
     let mut manifests = match client.get_manifest_raw(repo, reference).await {
-        Ok((bytes, ct)) if ct.contains(INDEX_MEDIA_TYPE) => serde_json::from_slice::<OciIndex>(&bytes)
-            .map(|i| i.manifests)
-            .unwrap_or_default(),
+        Ok((bytes, ct)) if ct.contains(INDEX_MEDIA_TYPE) => {
+            serde_json::from_slice::<OciIndex>(&bytes)
+                .map(|i| i.manifests)
+                .unwrap_or_default()
+        }
         _ => Vec::new(),
     };
     manifests.retain(|m| m.platform.as_ref() != Some(&platform));

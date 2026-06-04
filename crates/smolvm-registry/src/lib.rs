@@ -73,20 +73,30 @@ impl OciPlatform {
             "x86_64" => "amd64",
             other => other,
         };
-        Self { os: os.to_string(), architecture: architecture.to_string(), variant: None }
+        Self {
+            os: os.to_string(),
+            architecture: architecture.to_string(),
+            variant: None,
+        }
     }
 
     /// Parse a `host_platform` string (`"darwin/arm64"`, `"linux/x86_64"`) into a
     /// platform descriptor, normalizing the arch (`x86_64`→`amd64`,
     /// `aarch64`→`arm64`) so index entries and `current()` always agree.
     pub fn parse(host_platform: &str) -> Self {
-        let (os, arch) = host_platform.split_once('/').unwrap_or(("linux", host_platform));
+        let (os, arch) = host_platform
+            .split_once('/')
+            .unwrap_or(("linux", host_platform));
         let architecture = match arch {
             "x86_64" => "amd64",
             "aarch64" => "arm64",
             other => other,
         };
-        Self { os: os.to_string(), architecture: architecture.to_string(), variant: None }
+        Self {
+            os: os.to_string(),
+            architecture: architecture.to_string(),
+            variant: None,
+        }
     }
 
     /// Human label, e.g. `linux/amd64`.
@@ -198,7 +208,10 @@ mod platform_tests {
     fn parse_normalizes_arch_and_os() {
         // host_platform strings (as written into PackManifest) → OCI platform.
         let p = OciPlatform::parse("darwin/arm64");
-        assert_eq!((p.os.as_str(), p.architecture.as_str()), ("darwin", "arm64"));
+        assert_eq!(
+            (p.os.as_str(), p.architecture.as_str()),
+            ("darwin", "arm64")
+        );
         // x86_64/aarch64 normalize to amd64/arm64 so index entries and current()
         // always compare equal.
         assert_eq!(OciPlatform::parse("linux/x86_64").architecture, "amd64");
@@ -245,11 +258,18 @@ mod platform_tests {
         assert_eq!(back.manifests.len(), 2);
         // pull's selection: find the entry whose platform == the wanted one.
         let want = OciPlatform::parse("linux/amd64");
-        let hit = back.manifests.iter().find(|m| m.platform.as_ref() == Some(&want)).unwrap();
+        let hit = back
+            .manifests
+            .iter()
+            .find(|m| m.platform.as_ref() == Some(&want))
+            .unwrap();
         assert_eq!(hit.digest, "sha256:bbb");
         // a platform not present → no match (pull would 404 with the available list).
         let miss = OciPlatform::parse("windows/amd64");
-        assert!(back.manifests.iter().all(|m| m.platform.as_ref() != Some(&miss)));
+        assert!(back
+            .manifests
+            .iter()
+            .all(|m| m.platform.as_ref() != Some(&miss)));
     }
 }
 

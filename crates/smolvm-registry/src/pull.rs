@@ -64,7 +64,11 @@ pub async fn pull(
                 RegistryError::InvalidManifest(format!(
                     "no {} build available for this machine; the registry has: {}",
                     want.label(),
-                    if available.is_empty() { "(none)".into() } else { available.join(", ") }
+                    if available.is_empty() {
+                        "(none)".into()
+                    } else {
+                        available.join(", ")
+                    }
                 ))
             })?;
         tracing::info!(platform = %want.label(), digest = %entry.digest, "selected index entry");

@@ -354,7 +354,11 @@ impl RegistryClient {
         // (the registry validates the Content-Type against the body's mediaType).
         let media_type = serde_json::from_slice::<serde_json::Value>(manifest)
             .ok()
-            .and_then(|v| v.get("mediaType").and_then(|m| m.as_str()).map(String::from))
+            .and_then(|v| {
+                v.get("mediaType")
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
+            })
             .unwrap_or_else(|| MANIFEST_MEDIA_TYPE.to_string());
         let url = format!("{}/v2/{}/manifests/{}", self.base_url, repo, reference);
         let resp = self
@@ -435,7 +439,10 @@ impl RegistryClient {
             .await?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(RegistryError::BlobNotFound(format!("{}:{}", repo, reference)));
+            return Err(RegistryError::BlobNotFound(format!(
+                "{}:{}",
+                repo, reference
+            )));
         }
         if !resp.status().is_success() {
             return Err(RegistryError::ApiError {
