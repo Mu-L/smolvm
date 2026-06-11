@@ -155,6 +155,20 @@ impl RegistryConfig {
     pub fn set_token(&mut self, registry: &str, token: &str) {
         self.set_credentials(registry, "token".to_string(), token.to_string());
     }
+
+    /// Store an upstream identity credential (e.g. an Auth0 JWT) for the
+    /// registry. Unlike [`Self::set_token`], the credential is NOT sent to the
+    /// registry directly — `build_registry_client` exchanges it at the
+    /// registry's token service per operation (the OCI challenge flow), which
+    /// is the only form the smolmachines registry accepts. Clears any
+    /// direct-bearer fields so the exchange path always wins; preserves mirror.
+    pub fn set_identity_token(&mut self, registry: &str, token: &str) {
+        let entry = self.registries.entry(registry.to_string()).or_default();
+        entry.identity_token = Some(token.to_string());
+        entry.username = None;
+        entry.password = None;
+        entry.password_env = None;
+    }
 }
 
 /// Default registry when none specified in image reference.
@@ -214,6 +228,11 @@ pub fn rewrite_image_registry(image: &str, new_registry: &str) -> String {
 
 /// Default registry for smolmachines artifacts.
 pub const SMOLMACHINES_REGISTRY: &str = "registry.smolmachines.com";
+
+/// The control-plane API paired with [`SMOLMACHINES_REGISTRY`] — its OCI token
+/// realm (`/v2/auth`) and identity endpoint (`/v1/me`) live here. Overridable
+/// via the `SMOL_CLOUD_API` env var for self-hosted control planes.
+pub const SMOLMACHINES_API: &str = "https://api.smolmachines.com";
 
 /// Error parsing an artifact reference.
 #[derive(Debug, Clone, PartialEq)]
