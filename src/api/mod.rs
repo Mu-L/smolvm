@@ -238,12 +238,19 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // Prometheus metrics
     let metrics_route = Router::new().route("/metrics", get(serve_metrics));
 
-    // Combine all routes
+    // Combine all routes. The machine-control surface (`/api/v1/*`) is gated by
+    // an optional bearer token (`SMOLVM_SERVE_TOKEN`): unset → open (local/dev,
+    // unchanged); set → the control plane must present it, so a host merely on
+    // the node's internal network can't drive machines. `/health` + `/capacity`
+    // stay open for liveness/scheduling probes; `/metrics` keeps its own token.
     Router::new()
         .merge(health_route)
         .merge(capacity_route)
         .merge(metrics_route)
-        .nest("/api/v1", api_v1)
+        .nest(
+            "/api/v1",
+            api_v1.route_layer(middleware::from_fn(serve_auth_middleware)),
+        )
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .layer(middleware::from_fn(trace_id_middleware))
         .layer(TraceLayer::new_for_http())
@@ -284,6 +291,43 @@ fn normalize_metrics_path(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+/// Constant-time byte compare for the serve token (length difference returns
+/// early — negligible leakage for a high-entropy token).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Optional bearer-token auth for `/api/v1/*`. When `SMOLVM_SERVE_TOKEN` is set,
+/// every request must carry `Authorization: Bearer <token>`; when unset the
+/// surface is open (unchanged local/dev behavior).
+async fn serve_auth_middleware(req: Request, next: Next) -> Response {
+    use axum::http::{header::AUTHORIZATION, StatusCode};
+    use axum::response::IntoResponse;
+
+    if let Some(expected) = std::env::var("SMOLVM_SERVE_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        let presented = req
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "));
+        let ok = presented.is_some_and(|tok| ct_eq(tok.as_bytes(), expected.as_bytes()));
+        if !ok {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
+    next.run(req).await
 }
 
 /// Trace ID for correlating API requests to agent operations.
