@@ -6,9 +6,12 @@
 //! cert (the control plane) may connect. This module builds the rustls
 //! `ServerConfig` that enforces `require_and_verify_client_cert`.
 //!
-//! **Fail-closed:** in fleet mode (`SMOLVM_PUBLISH_ADDR` set) the serve API
-//! refuses to start without TLS configured — it must never fall back to plain
-//! HTTP / the interim bearer token when it believes it is fleet-managed.
+//! **Fail-closed:** when `SMOLVM_SERVE_REQUIRE_MTLS=1` the serve API refuses to
+//! start without TLS configured — it must never fall back to plain HTTP / the
+//! interim bearer token when the deploy declared it should be mTLS-protected.
+//! This is a DEDICATED opt-in, deliberately NOT keyed off `SMOLVM_PUBLISH_ADDR`
+//! (which every worker sets for the published-port datapath — overloading it
+//! would make plain-HTTP workers refuse to boot).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,12 +26,17 @@ const ENV_CERT: &str = "SMOLVM_SERVE_TLS_CERT";
 const ENV_KEY: &str = "SMOLVM_SERVE_TLS_KEY";
 /// Env var holding the PEM node-CA cert used to verify the control's client cert.
 const ENV_CLIENT_CA: &str = "SMOLVM_SERVE_TLS_CLIENT_CA";
-/// Fleet-mode indicator (also drives force-virtio in the launch path).
-const ENV_FLEET: &str = "SMOLVM_PUBLISH_ADDR";
+/// Dedicated opt-in: the deploy declares this serve API MUST run mTLS. When set,
+/// a missing/partial cert config is fatal (fail-closed) rather than a silent
+/// fall-back to plain HTTP. NOT keyed off `SMOLVM_PUBLISH_ADDR` (see module doc).
+const ENV_REQUIRE_MTLS: &str = "SMOLVM_SERVE_REQUIRE_MTLS";
 
-/// True when this serve process believes it is fleet-managed.
-pub fn fleet_mode() -> bool {
-    std::env::var_os(ENV_FLEET).is_some()
+/// True when the deploy has declared this serve API must be mTLS-protected.
+pub fn require_mtls() -> bool {
+    matches!(
+        std::env::var(ENV_REQUIRE_MTLS).ok().as_deref(),
+        Some("1") | Some("true")
+    )
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -40,8 +48,8 @@ fn env_path(name: &str) -> Option<PathBuf> {
 /// Resolve the serve API's TLS posture from the environment.
 ///
 /// - All three TLS env vars set ⇒ `Ok(Some(config))` (mTLS, client cert required).
-/// - None set, not fleet mode ⇒ `Ok(None)` (plain HTTP, local/dev).
-/// - **Fleet mode but TLS not fully configured ⇒ `Err` (fail-closed).**
+/// - None set, mTLS not required ⇒ `Ok(None)` (plain HTTP, local/dev/non-mTLS worker).
+/// - **`SMOLVM_SERVE_REQUIRE_MTLS` set but TLS not fully configured ⇒ `Err` (fail-closed).**
 /// - A partial config (some but not all vars) ⇒ `Err` (misconfiguration).
 pub fn resolve_tls() -> Result<Option<Arc<ServerConfig>>, String> {
     let cert = env_path(ENV_CERT);
@@ -53,10 +61,10 @@ pub fn resolve_tls() -> Result<Option<Arc<ServerConfig>>, String> {
             Ok(Some(build_server_config(&cert, &key, &client_ca)?))
         }
         (None, None, None) => {
-            if fleet_mode() {
+            if require_mtls() {
                 Err(format!(
-                    "fleet mode ({ENV_FLEET} set) requires mTLS, but {ENV_CERT}/{ENV_KEY}/{ENV_CLIENT_CA} are unset — \
-                     refusing to start a fleet serve API without client-cert verification (fail-closed)"
+                    "{ENV_REQUIRE_MTLS} is set but {ENV_CERT}/{ENV_KEY}/{ENV_CLIENT_CA} are unset — \
+                     refusing to start without client-cert verification (fail-closed)"
                 ))
             } else {
                 Ok(None)
@@ -138,26 +146,37 @@ mod tests {
     }
 
     fn clear() {
-        for v in [ENV_CERT, ENV_KEY, ENV_CLIENT_CA, ENV_FLEET] {
+        for v in [ENV_CERT, ENV_KEY, ENV_CLIENT_CA, ENV_REQUIRE_MTLS] {
             std::env::remove_var(v);
         }
     }
 
     #[test]
-    fn no_env_no_fleet_is_plain_http() {
+    fn no_env_not_required_is_plain_http() {
         let _g = lock();
         clear();
         assert!(resolve_tls().unwrap().is_none());
     }
 
     #[test]
-    fn fleet_without_tls_fails_closed() {
+    fn require_mtls_without_tls_fails_closed() {
         let _g = lock();
         clear();
-        std::env::set_var(ENV_FLEET, "0.0.0.0");
+        std::env::set_var(ENV_REQUIRE_MTLS, "1");
         let err = resolve_tls().unwrap_err();
         assert!(err.contains("fail-closed"), "{err}");
         clear();
+    }
+
+    #[test]
+    fn publish_addr_alone_does_not_force_mtls() {
+        // A worker sets SMOLVM_PUBLISH_ADDR for the datapath; that must NOT make
+        // a plain-HTTP serve refuse to start.
+        let _g = lock();
+        clear();
+        std::env::set_var("SMOLVM_PUBLISH_ADDR", "0.0.0.0");
+        assert!(resolve_tls().unwrap().is_none());
+        std::env::remove_var("SMOLVM_PUBLISH_ADDR");
     }
 
     #[test]
