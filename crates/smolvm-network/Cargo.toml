@@ -27,3 +27,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
 ] }
 socket2 = "0.6"
 tracing = { workspace = true }
+
+[features]
+# Exposes fuzz-only entrypoints (e.g. fuzz_classify_guest_frame). Never enabled in normal builds.
+fuzzing = []
