@@ -965,6 +965,223 @@ fn json_string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// OCI/AUFS whiteout marker that deletes a single name from lower layers
+/// (`.wh.<name>`).
+const WHITEOUT_PREFIX: &str = ".wh.";
+/// OCI/AUFS opaque-directory marker: the directory replaces, rather than merges
+/// with, the same directory in lower layers (`.wh..wh..opq`).
+const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
+
+/// What an OCI layer tar entry means once its name is interpreted.
+#[derive(Debug, PartialEq, Eq)]
+enum LayerEntry<'a> {
+    /// `.wh..wh..opq`: mark the parent directory opaque.
+    OpaqueDir,
+    /// `.wh.<name>`: delete `<name>` from lower layers (carries `<name>`).
+    Whiteout(&'a str),
+    /// An ordinary entry to extract as-is.
+    Normal,
+}
+
+/// Classify an entry by its file name. The opaque marker must be checked before
+/// the generic `.wh.` prefix, since `.wh..wh..opq` also starts with `.wh.`.
+fn classify_layer_entry(file_name: &str) -> LayerEntry<'_> {
+    if file_name == OPAQUE_WHITEOUT {
+        return LayerEntry::OpaqueDir;
+    }
+    match file_name.strip_prefix(WHITEOUT_PREFIX) {
+        Some(name) if !name.is_empty() => LayerEntry::Whiteout(name),
+        _ => LayerEntry::Normal,
+    }
+}
+
+/// Join `rel` under `base`, returning `None` if any component would escape the
+/// base (`..`, an absolute path, or a Windows-style prefix). Mirrors the
+/// containment guard tar extractors use to prevent path-traversal.
+fn jailed_join(base: &Path, rel: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = base.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Create an overlayfs whiteout (a `mknod` character device with device number
+/// 0/0) at `path`, replacing any existing entry. This is how the kernel's
+/// overlayfs records "this name is deleted from lower layers" — the on-disk
+/// representation that OCI's `.wh.<name>` marker must be translated into.
+///
+/// Linux-only: overlayfs whiteouts are a Linux concept and the agent only runs
+/// in the Linux guest. The non-Linux stub keeps the crate compiling on the
+/// macOS host (where `mknod`/`makedev`/xattr signatures differ).
+#[cfg(target_os = "linux")]
+fn create_overlay_whiteout(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    // Clear any entry the layer may already have written at this name so mknod
+    // doesn't fail with EEXIST.
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(path);
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `c_path` is a valid NUL-terminated path; mode and dev are scalars.
+    let rc = unsafe {
+        libc::mknod(
+            c_path.as_ptr(),
+            libc::S_IFCHR as libc::mode_t,
+            libc::makedev(0, 0),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_overlay_whiteout(_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "overlayfs whiteouts are only created in the Linux guest",
+    ))
+}
+
+/// Mark `dir` opaque for overlayfs via the `trusted.overlay.opaque` xattr — the
+/// representation of OCI's `.wh..wh..opq` marker. Linux-only (see
+/// [`create_overlay_whiteout`]).
+#[cfg(target_os = "linux")]
+fn set_overlay_opaque(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let name = std::ffi::CString::new("trusted.overlay.opaque").expect("static xattr name");
+    let value = b"y";
+    // SAFETY: path/name are NUL-terminated; value/len describe a valid buffer.
+    let rc = unsafe {
+        libc::setxattr(
+            c_path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_overlay_opaque(_dir: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "overlayfs opaque dirs are only set in the Linux guest",
+    ))
+}
+
+/// Extract one decompressed OCI layer tar into `dest`, applying OCI whiteout
+/// semantics so the overlayfs composition is correct.
+///
+/// Each layer is extracted in isolation into its own directory (later stacked as
+/// an overlayfs lowerdir). A plain `tar -x` does not give the kernel's overlayfs
+/// what it needs, so this translates at unpack time — the same conversion
+/// containerd / docker-overlay2 / containers-storage perform:
+/// - `.wh.<name>` (delete marker) → an overlayfs whiteout (`mknod c 0 0`), so
+///   the stacked overlay hides `<name>` from lower layers. (busybox `tar` left
+///   it as a plain file overlayfs ignores, so deletions never applied; worse,
+///   some images ship the marker as a hardlink to a lower-layer file, which
+///   aborted the whole extraction — issue #397. Whiteouts are handled by name
+///   here, before the hardlink path, so that case is just a normal whiteout.)
+/// - `.wh..wh..opq` (opaque-dir marker) → the `trusted.overlay.opaque` xattr on
+///   its parent directory.
+/// - a hardlink whose target isn't in this layer (it lives in a lower layer) is
+///   skipped rather than failing; overlayfs resolves the real file at runtime.
+///
+/// Requires `CAP_MKNOD` + `CAP_SYS_ADMIN`, which the agent has as guest PID 1.
+fn extract_oci_layer<R: std::io::Read>(reader: R, dest: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut archive = tar::Archive::new(reader);
+    archive.set_preserve_permissions(true);
+    archive.set_preserve_mtime(true);
+    archive.set_overwrite(true);
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+
+        // Jail the on-disk path under the layer dir (defends against `..` and
+        // absolute paths embedded in the archive).
+        let Some(full_path) = jailed_join(dest, &path) else {
+            warn!(path = %path.display(), "skipping layer entry that escapes the layer dir");
+            continue;
+        };
+
+        // Whiteout markers are interpreted by name, before normal extraction.
+        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+            match classify_layer_entry(file_name) {
+                LayerEntry::OpaqueDir => {
+                    if let Some(parent) = full_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                        set_overlay_opaque(parent)?;
+                    }
+                    continue;
+                }
+                LayerEntry::Whiteout(removed) => {
+                    if let Some(parent) = full_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                        create_overlay_whiteout(&parent.join(removed))?;
+                    }
+                    continue;
+                }
+                LayerEntry::Normal => {}
+            }
+        }
+
+        // A hardlink whose target wasn't extracted into this layer can't be
+        // created here; skip it (overlayfs resolves the lower-layer file).
+        if entry.header().entry_type() == tar::EntryType::Link {
+            let target = entry.link_name()?.and_then(|link| jailed_join(dest, &link));
+            if target.is_none_or(|t| !t.exists()) {
+                continue;
+            }
+        }
+
+        // Ensure the parent is writable before extracting children — OCI layers
+        // can set restrictive directory modes before their contents.
+        if let Some(parent) = full_path.parent() {
+            if parent.is_dir() {
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        if let Err(e) = entry.unpack_in(dest) {
+            // Regular files and directories failing is a real error; non-regular
+            // entries (symlinks, device nodes, fifos) can fail benignly — skip.
+            match entry.header().entry_type() {
+                tar::EntryType::Regular
+                | tar::EntryType::GNUSparse
+                | tar::EntryType::Continuous
+                | tar::EntryType::Directory => {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!("failed to unpack '{}': {}", path.display(), e),
+                    ));
+                }
+                _ => {
+                    warn!(path = %path.display(), error = %e, "skipping non-regular layer entry");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Pull an OCI image with progress callback and optional authentication.
 ///
 /// The callback is called for each layer being pulled with (current, total, layer_id).
@@ -1167,48 +1384,57 @@ where
             .spawn()
             .map_err(|e| StorageError::new(format!("failed to spawn crane: {}", e)))?;
 
-        // Build tar command with crane's stdout as input
+        // Decompress with busybox `gunzip` and extract with our OCI-aware
+        // extractor. Keeping gzip external avoids linking a decompressor crate
+        // into the size-sensitive agent; reading the stream to EOF also drives
+        // the crane -> gunzip pipeline.
         let crane_stdout = crane
             .stdout
             .take()
             .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
 
-        let mut tar_cmd = Command::new("tar");
-        tar_cmd.args(["-xzf", "-", "-C"]);
-        tar_cmd.arg(&layer_dir);
-        tar_cmd.stdin(crane_stdout);
-        tar_cmd.stdout(Stdio::null());
-        tar_cmd.stderr(Stdio::piped());
+        let mut gunzip = Command::new("gunzip")
+            .arg("-c")
+            .stdin(crane_stdout)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| StorageError::new(format!("failed to spawn gunzip: {}", e)))?;
 
-        // Run tar and wait for it
-        let tar_output = tar_cmd
-            .output()
-            .map_err(|e| StorageError::new(format!("failed to run tar: {}", e)))?;
+        let gunzip_stdout = gunzip
+            .stdout
+            .take()
+            .ok_or_else(|| StorageError::new("failed to capture gunzip stdout".to_string()))?;
 
-        // Wait for crane to finish and check its status
+        let extract_result = extract_oci_layer(gunzip_stdout, &layer_dir);
+
+        let gunzip_status = gunzip
+            .wait()
+            .map_err(|e| StorageError::new(format!("failed to wait for gunzip: {}", e)))?;
         let crane_status = crane
             .wait()
             .map_err(|e| StorageError::new(format!("failed to wait for crane: {}", e)))?;
 
-        if !crane_status.success() {
-            if let Err(e) = std::fs::remove_dir_all(&layer_dir) {
-                warn!(layer = %layer_id, error = %e, "failed to clean up layer directory after crane failure");
-            }
-            return Err(StorageError::new(format!(
-                "crane blob failed for layer {}",
-                layer_digest
-            )));
-        }
+        // crane failure (network/auth) is the most useful error to surface, and
+        // it manifests downstream as a truncated stream, so check it first.
+        let layer_failure = if !crane_status.success() {
+            Some(format!("crane blob failed for layer {}", layer_digest))
+        } else if let Err(e) = extract_result {
+            Some(format!(
+                "layer extraction failed for layer {}: {}",
+                layer_digest, e
+            ))
+        } else if !gunzip_status.success() {
+            Some(format!("gunzip failed for layer {}", layer_digest))
+        } else {
+            None
+        };
 
-        if !tar_output.status.success() {
+        if let Some(message) = layer_failure {
             if let Err(e) = std::fs::remove_dir_all(&layer_dir) {
-                warn!(layer = %layer_id, error = %e, "failed to clean up layer directory after tar failure");
+                warn!(layer = %layer_id, error = %e, "failed to clean up layer directory after extraction failure");
             }
-            let stderr = String::from_utf8_lossy(&tar_output.stderr);
-            return Err(StorageError::new(format!(
-                "tar extraction failed for layer {}: {}",
-                layer_digest, stderr
-            )));
+            return Err(StorageError::new(message));
         }
 
         if let Ok(size) = dir_size(&layer_dir) {
@@ -3067,6 +3293,136 @@ mod tests {
     #[test]
     fn test_oci_platform_to_arch_linux_arm64() {
         assert_eq!(oci_platform_to_arch("linux/arm64"), "arm64");
+    }
+
+    #[test]
+    fn classifies_oci_whiteout_markers() {
+        // Opaque marker must win over the generic `.wh.` prefix.
+        assert_eq!(classify_layer_entry(".wh..wh..opq"), LayerEntry::OpaqueDir);
+        // `.wh.<name>` carries the name to delete.
+        assert_eq!(
+            classify_layer_entry(".wh.RPM-GPG-KEY-kojiv2"),
+            LayerEntry::Whiteout("RPM-GPG-KEY-kojiv2")
+        );
+        // A bare `.wh.` (no name) and ordinary files are normal entries.
+        assert_eq!(classify_layer_entry(".wh."), LayerEntry::Normal);
+        assert_eq!(classify_layer_entry("CERN.repo"), LayerEntry::Normal);
+        assert_eq!(classify_layer_entry(".wherever"), LayerEntry::Normal);
+    }
+
+    #[test]
+    fn jailed_join_blocks_escapes() {
+        let base = Path::new("/layer");
+        assert_eq!(
+            jailed_join(base, Path::new("tmp/CERN.repo")),
+            Some(PathBuf::from("/layer/tmp/CERN.repo"))
+        );
+        assert_eq!(
+            jailed_join(base, Path::new("./tmp/./x")),
+            Some(PathBuf::from("/layer/tmp/x"))
+        );
+        // `..` and absolute paths escape the layer dir — rejected.
+        assert!(jailed_join(base, Path::new("../etc/passwd")).is_none());
+        assert!(jailed_join(base, Path::new("tmp/../../etc")).is_none());
+        assert!(jailed_join(base, Path::new("/etc/passwd")).is_none());
+    }
+
+    /// End-to-end extraction with whiteout conversion. mknod/setxattr(trusted.*)
+    /// need root, so skip when not privileged (the live guest is PID 1 root).
+    /// Linux-only: the syscalls and overlayfs semantics don't exist on macOS.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn extract_oci_layer_applies_whiteouts() {
+        // SAFETY: geteuid is always safe.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: extract_oci_layer whiteout test needs root (mknod/setxattr)");
+            return;
+        }
+        use std::os::unix::fs::FileTypeExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+
+        // Build a layer tar: a real file, a `.wh.` delete marker shipped as a
+        // hardlink to that file (the issue #397 shape), and an opaque dir.
+        let mut buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            let mut header = tar::Header::new_gnu();
+            let body = b"repo-contents";
+            header.set_path("tmp/CERN.repo").unwrap();
+            header.set_size(body.len() as u64);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &body[..]).unwrap();
+
+            // Whiteout as a hardlink to the sibling file (would crash busybox tar).
+            let mut wh = tar::Header::new_gnu();
+            wh.set_entry_type(tar::EntryType::Link);
+            wh.set_size(0);
+            wh.set_mode(0o644);
+            wh.set_path("tmp/.wh.RPM-GPG-KEY-kojiv2").unwrap();
+            wh.set_link_name("tmp/CERN.repo").unwrap();
+            wh.set_cksum();
+            builder.append(&wh, std::io::empty()).unwrap();
+
+            // Opaque marker for an `etc` directory.
+            let mut opq = tar::Header::new_gnu();
+            opq.set_entry_type(tar::EntryType::Regular);
+            opq.set_size(0);
+            opq.set_mode(0o644);
+            opq.set_path("etc/.wh..wh..opq").unwrap();
+            opq.set_cksum();
+            builder.append(&opq, std::io::empty()).unwrap();
+
+            builder.finish().unwrap();
+        }
+
+        extract_oci_layer(&buf[..], dest).expect("extraction should succeed");
+
+        // The real file extracted.
+        assert_eq!(
+            std::fs::read(dest.join("tmp/CERN.repo")).unwrap(),
+            b"repo-contents"
+        );
+        // The whiteout became an overlayfs char-device whiteout (0/0).
+        let wh = dest.join("tmp/RPM-GPG-KEY-kojiv2");
+        let meta = std::fs::symlink_metadata(&wh).expect("whiteout node exists");
+        assert!(
+            meta.file_type().is_char_device(),
+            "whiteout is a char device"
+        );
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(meta.rdev(), 0, "whiteout device number is 0/0");
+        // The `.wh.` marker file itself is gone.
+        assert!(!dest.join("tmp/.wh.RPM-GPG-KEY-kojiv2").exists());
+        // The opaque xattr is set on the directory, and the marker file is gone.
+        assert!(dest.join("etc").is_dir());
+        assert_eq!(read_opaque_xattr(&dest.join("etc")), Some(b"y".to_vec()));
+        assert!(!dest.join("etc/.wh..wh..opq").exists());
+    }
+
+    /// Read `trusted.overlay.opaque` for the extraction test (root-only).
+    #[cfg(target_os = "linux")]
+    fn read_opaque_xattr(path: &Path) -> Option<Vec<u8>> {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        let name = std::ffi::CString::new("trusted.overlay.opaque").ok()?;
+        let mut buf = [0u8; 16];
+        // SAFETY: path/name are NUL-terminated; buf/len describe a valid buffer.
+        let len = unsafe {
+            libc::getxattr(
+                c_path.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        if len < 0 {
+            return None;
+        }
+        Some(buf[..len as usize].to_vec())
     }
 
     #[test]
