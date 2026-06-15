@@ -138,27 +138,26 @@ async fn attach_and_mount(
     Ok(mp)
 }
 
+/// Persistent-disk type for new volumes. `pd-balanced` by default; override with
+/// `SMOLVM_PD_DISK_TYPE` (e.g. `pd-standard` for cheaper/quota-flexible storage).
+fn pd_disk_type() -> String {
+    std::env::var("SMOLVM_PD_DISK_TYPE").unwrap_or_else(|_| "pd-balanced".to_string())
+}
+
 /// Create a fresh PD, attach + format + mount it. Returns `(node_path, disk_name)`
 /// — the control plane stores `disk_name` as the volume's failover handle.
 pub async fn provision(id: &str, size_gb: u64) -> Result<(String, String), ApiError> {
     let (zone, instance) = instance_identity().await?;
     let disk_name = disk_name_for(id);
-    let size = size_gb.max(10); // GCP pd-balanced minimum is 10 GiB
+    let size = size_gb.max(10); // GCP persistent-disk minimum is 10 GiB
+    let disk_type = pd_disk_type();
+    let size_arg = format!("{size}GB");
 
     run(
         "gcloud",
         &[
-            "compute",
-            "disks",
-            "create",
-            &disk_name,
-            "--size",
-            &format!("{size}GB"),
-            "--type",
-            "pd-balanced",
-            "--zone",
-            &zone,
-            "--quiet",
+            "compute", "disks", "create", &disk_name, "--size", &size_arg, "--type", &disk_type,
+            "--zone", &zone, "--quiet",
         ],
     )
     .await?;
