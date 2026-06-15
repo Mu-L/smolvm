@@ -5,6 +5,7 @@
 
 use std::os::fd::IntoRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
@@ -577,10 +578,64 @@ pub fn drop_privileges(_uid: u32, _gid: u32) -> std::result::Result<(), String> 
     Ok(())
 }
 
-/// Install a SIGCHLD handler to automatically reap zombie child processes.
+/// PIDs of detached VM boot subprocesses to reap. Registered by
+/// [`register_vm_child`] right after spawn (the boot subprocess is intentionally
+/// detached — own process group, never `wait()`ed — so it becomes a zombie on
+/// exit). Swept by [`reap_vm_children`] from the supervisor tick.
 ///
-/// This function installs a signal handler that calls waitpid(-1, WNOHANG) to
-/// reap any terminated child processes, preventing zombie accumulation.
+/// This is the SELECTIVE reaper used by `serve`, replacing a global
+/// `waitpid(-1)` SIGCHLD handler. An unscoped `waitpid(-1)` steals the exit
+/// status from ANY exited child — including the `busctl` / `mkfs` / `resize2fs`
+/// subprocesses that `.output()`/`.wait()` callers (e.g. systemd-scope adoption)
+/// are actively waiting on — producing `ECHILD` ("No child processes") races
+/// under concurrent VM boots. Reaping only registered VM PIDs leaves those
+/// transient subprocesses to their own waits. Mirrors the guest agent's
+/// `BG_CHILDREN` pattern (`crates/smolvm-agent/src/main.rs`).
+static VM_CHILDREN: OnceLock<Mutex<Vec<i32>>> = OnceLock::new();
+
+fn vm_children() -> &'static Mutex<Vec<i32>> {
+    VM_CHILDREN.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Track a detached VM boot subprocess PID so a later [`reap_vm_children`] sweep
+/// reaps it. The Rust `Child` handle's `Drop` does not `wait()`, so the caller
+/// can let it drop after recording the PID.
+pub fn register_vm_child(pid: i32) {
+    vm_children().lock().unwrap().push(pid);
+}
+
+/// Reap any exited registered VM children (non-blocking, per-PID). Called from
+/// the serve supervisor tick. Scoped to registered PIDs so it never steals an
+/// exit status from a sibling `.output()`/`.wait()` (the `ECHILD` fix).
+#[cfg(target_os = "linux")]
+pub fn reap_vm_children() {
+    let mut guard = vm_children().lock().unwrap();
+    guard.retain(|&pid| {
+        let ret = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        match ret {
+            // >0 = reaped; drop from tracking.
+            r if r > 0 => false,
+            // 0 = still running; keep for the next sweep.
+            0 => true,
+            // <0 = error (typically ECHILD — already gone). Drop either way.
+            _ => false,
+        }
+    });
+}
+
+/// No-op on non-Linux: VM scope adoption + the serve supervisor reaper are
+/// Linux-only; nothing registers VM children here.
+#[cfg(not(target_os = "linux"))]
+pub fn reap_vm_children() {}
+
+/// Install a GLOBAL SIGCHLD handler that reaps every terminated child via
+/// `waitpid(-1, WNOHANG)`. Used only by the `pack_run` fork-pool paths (single
+/// process, no concurrent `.output()` subprocesses racing it).
+///
+/// **Do NOT use this in `serve`** — its concurrent VM boots run `busctl`/`mkfs`
+/// `.output()` calls that this handler would reap out from under, causing
+/// `ECHILD`. `serve` uses the selective [`register_vm_child`]/[`reap_vm_children`]
+/// pair instead.
 ///
 /// The handler is only installed once; subsequent calls are no-ops.
 ///
@@ -1685,6 +1740,38 @@ mod tests {
             unsafe { libc::getuid() },
             1,
             "drop must not have taken effect"
+        );
+    }
+
+    /// The selective reaper drains registered VM PIDs once they exit, and a
+    /// non-child PID (would-be ECHILD) is dropped without affecting others.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reap_vm_children_is_scoped_and_drains() {
+        // A real short-lived child: register its PID and forget the handle so the
+        // reaper (not Child::drop) reaps it.
+        let child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let real_pid = child.id() as i32;
+        std::mem::forget(child);
+        register_vm_child(real_pid);
+        // A PID we never parented → waitpid returns ECHILD → must be dropped.
+        register_vm_child(i32::MAX);
+
+        // Sweep until the registry drains (the real child exits ~immediately).
+        let mut drained = false;
+        for _ in 0..50 {
+            reap_vm_children();
+            if vm_children().lock().unwrap().is_empty() {
+                drained = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            drained,
+            "registry should drain: real child reaped, bogus PID dropped on ECHILD"
         );
     }
 }

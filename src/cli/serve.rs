@@ -173,8 +173,12 @@ impl ServeStartCmd {
             }
         }
 
-        // Install SIGCHLD handler to reap zombie VM child processes.
-        smolvm::process::install_sigchld_handler();
+        // VM boot subprocesses are detached and would zombie on exit; they are
+        // reaped SELECTIVELY (per registered PID) by the supervisor tick via
+        // smolvm::process::reap_vm_children(). We deliberately do NOT install the
+        // global waitpid(-1) SIGCHLD handler here: serve's concurrent boots run
+        // busctl/mkfs `.output()` subprocesses that a global reaper would steal,
+        // causing ECHILD ("No child processes") and failed scope adoption.
 
         // Install Prometheus metrics recorder and mark start time
         if let Some(handle) = smolvm::api::install_metrics_recorder() {

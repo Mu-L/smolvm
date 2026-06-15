@@ -1458,6 +1458,13 @@ impl AgentManager {
             .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
 
         let child_pid = child.id() as i32;
+        // Register the detached VM PID for the serve supervisor's selective
+        // reaper. The boot subprocess owns its process group and is never
+        // `wait()`ed, so it would zombie on exit; the supervisor tick reaps it.
+        // (In non-serve callers without a supervisor this is a harmless no-op —
+        // the sweep is only driven from serve.) The `child` handle drops without
+        // waiting (Rust `Child::drop` is a no-op), leaving the PID for the sweep.
+        crate::process::register_vm_child(child_pid);
         tracing::info!(
             pid = child_pid,
             spawn_ms = spawn_start.elapsed().as_millis(),

@@ -41,6 +41,10 @@ impl Supervisor {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    // Reap exited VM boot subprocesses (selective, per registered
+                    // PID) BEFORE the health check, so a just-crashed VM's zombie
+                    // is gone and `is_alive` reports it crashed this same tick.
+                    crate::process::reap_vm_children();
                     self.check_all_machines().await;
                 }
                 _ = self.shutdown_rx.changed() => {
