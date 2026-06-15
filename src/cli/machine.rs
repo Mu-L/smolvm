@@ -585,6 +585,17 @@ impl RunCmd {
             (self.interactive, self.tty)
         };
 
+        // `--image -` consumes stdin to read the archive; `-i`/`-t` also bind
+        // stdin to the guest. They cannot both own stdin.
+        if self.image.as_deref() == Some("-") && (interactive || tty) {
+            return Err(smolvm::Error::config(
+                "machine run",
+                "`--image -` reads the image archive from stdin and cannot be \
+                 combined with -i/-t, which also use stdin.\n\
+                 Pipe the archive from a file instead: --image ./image.tar",
+            ));
+        }
+
         // Detect the common mistake of passing an image reference as a positional
         // argument instead of using --image.  clap's trailing_var_arg captures any
         // positional before "--" into `command`, so `smolvm machine run ubuntu:22.04

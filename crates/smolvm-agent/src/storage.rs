@@ -2320,6 +2320,13 @@ fn prepare_overlay_from_packed(
     workload_id: &str,
     packed_dir: &Path,
 ) -> Result<OverlayInfo> {
+    // An unpacked-image directory IS the rootfs — one lowerdir, not its subdirs
+    // treated as separate layers.
+    if is_rootfs_dir(packed_dir) {
+        return OverlaySetup::new(workload_id)?
+            .execute_or_remount(vec![packed_dir.display().to_string()]);
+    }
+
     // Find layer directories in packed_dir
     // Packed layers are named by short digest (first 12 chars of sha256)
     let mut layer_dirs: Vec<PathBuf> = Vec::new();
@@ -2387,8 +2394,24 @@ fn get_image_lowerdirs(image: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Whether `dir` is itself a root filesystem (an unpacked-image directory,
+/// `--image ./rootfs/`) rather than a set of layer subdirs — detected by the
+/// presence of standard top-level rootfs directories. A `.smolmachine`'s
+/// packed-layers dir holds per-layer subdirs, not these, so it reads as false.
+fn is_rootfs_dir(dir: &Path) -> bool {
+    ["bin", "usr", "etc", "sbin"]
+        .iter()
+        .any(|d| dir.join(d).is_dir())
+}
+
 /// Build lowerdir list from pre-packed layer directories.
 fn get_packed_lowerdirs(packed_dir: &Path) -> Result<Vec<String>> {
+    // An unpacked-image directory IS the rootfs — one lowerdir, not its subdirs
+    // treated as separate layers.
+    if is_rootfs_dir(packed_dir) {
+        return Ok(vec![packed_dir.display().to_string()]);
+    }
+
     let mut layer_dirs: Vec<PathBuf> = Vec::new();
 
     let entries = std::fs::read_dir(packed_dir)
