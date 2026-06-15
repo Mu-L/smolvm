@@ -152,6 +152,17 @@ impl Supervisor {
         let lifecycle = self.state.lifecycle_lock(name);
         let _guard = lifecycle.lock().await;
 
+        // Re-check liveness now that we hold the lock. We may have queued this
+        // restart while the machine was mid-boot (an API start or an earlier
+        // restart held the lock); by the time we acquire it the boot may have
+        // completed, so re-launching would kill+reboot a healthy machine and —
+        // under concurrent boots — double the disk-prep load. If it's alive
+        // again, there's nothing to restart.
+        if self.state.is_machine_alive(name) {
+            tracing::debug!(machine = %name, "machine came back alive before restart; skipping");
+            return Ok(());
+        }
+
         let entry = match self.state.get_machine(name) {
             Ok(entry) => entry,
             Err(_) => {
