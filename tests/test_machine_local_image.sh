@@ -128,6 +128,23 @@ test_stdin_guard_rejects_interactive() {
     return 0
 }
 
+# A Dockerfile is not an image — reject with a build-first hint, not a flatten error.
+test_dockerfile_rejected_with_hint() {
+    local dockerfile="$FIXTURE_DIR/Dockerfile"
+    printf 'FROM alpine:3.20\nRUN apk add curl\n' > "$dockerfile"
+
+    local output exit_code=0
+    output=$($SMOLVM machine run --image "$dockerfile" -- true 2>&1) || exit_code=$?
+    [[ $exit_code -ne 0 ]] || {
+        echo "FAIL: a Dockerfile should be rejected"
+        return 1
+    }
+    echo "$output" | grep -qi "Dockerfile" || {
+        echo "FAIL: expected a build-first hint, got: $output"
+        return 1
+    }
+}
+
 # Persistent lifecycle from an archive: create, start, exec, stop, restart.
 # Restart re-derives the local source and reopens the same on-disk rootfs.
 test_persistent_create_start_restart() {
@@ -174,6 +191,7 @@ run_test "Ephemeral: boot from docker-save archive file (offline)" test_ephemera
 run_test "Ephemeral: boot from archive on stdin (--image -)" test_ephemeral_from_stdin || true
 run_test "Ephemeral: boot from unpacked rootfs dir (#398)" test_ephemeral_from_rootfs_dir || true
 run_test "Guard: --image - with -it rejected before boot" test_stdin_guard_rejects_interactive || true
+run_test "Guard: Dockerfile rejected with build-first hint" test_dockerfile_rejected_with_hint || true
 run_test "Persistent: create/start/restart from archive" test_persistent_create_start_restart || true
 
 print_summary "Local Image Tests"

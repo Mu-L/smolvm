@@ -81,6 +81,45 @@ fn looks_local(image: &str) -> bool {
             .any(|suffix| image.ends_with(suffix))
 }
 
+/// Whether a local path is a Dockerfile rather than an image archive — so we can
+/// reject it with a build-first hint instead of a confusing flatten failure.
+/// Detected by the conventional name (`Dockerfile`/`Containerfile`, or a
+/// `*.Dockerfile`/`*.Containerfile` suffix) or a first meaningful line of `FROM`.
+fn looks_like_dockerfile(path: &Path) -> bool {
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        let lower = name.to_ascii_lowercase();
+        if lower == "dockerfile"
+            || lower == "containerfile"
+            || lower.ends_with(".dockerfile")
+            || lower.ends_with(".containerfile")
+        {
+            return true;
+        }
+    }
+    // Content sniff over the first few KB only (never slurp a multi-GB archive):
+    // skip blank/comment lines; a Dockerfile opens with FROM (or an ARG before
+    // it). A tar archive's header is binary, so the UTF-8 read simply fails.
+    let mut head = [0u8; 4096];
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(n) = std::io::Read::read(&mut file, &mut head) else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(&head[..n]) else {
+        return false;
+    };
+    for line in text.lines().take(50) {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let word = line.split_whitespace().next().unwrap_or("");
+        return word.eq_ignore_ascii_case("FROM") || word.eq_ignore_ascii_case("ARG");
+    }
+    false
+}
+
 /// A classified source resolved into something launchable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedImage {
@@ -167,6 +206,18 @@ fn stage_from_file(path: &Path, cache_base: &Path) -> Result<String> {
         return Err(Error::config(
             "--image",
             format!("{} is not a file", path.display()),
+        ));
+    }
+    if looks_like_dockerfile(path) {
+        return Err(Error::config(
+            "--image",
+            format!(
+                "{} looks like a Dockerfile, not an image.\n\
+                 smolvm boots images, it does not build them — build first, then \
+                 pass the result:\n  \
+                 docker build -t myapp . && docker save myapp | smolvm machine run --image - -- ...",
+                path.display()
+            ),
         ));
     }
     if meta.len() > MAX_ARCHIVE_BYTES {
@@ -312,6 +363,41 @@ mod tests {
                 "{a}"
             );
         }
+    }
+
+    #[test]
+    fn dockerfiles_are_rejected_with_a_build_hint() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // By name: `Dockerfile` (any case) and `*.Dockerfile`.
+        for name in [
+            "Dockerfile",
+            "dockerfile",
+            "Containerfile",
+            "app.Dockerfile",
+        ] {
+            let p = dir.path().join(name);
+            std::fs::write(&p, b"unreadable as a name test").unwrap();
+            assert!(looks_like_dockerfile(&p), "{name}");
+        }
+
+        // By content: a file not named Dockerfile but opening with FROM.
+        let by_content = dir.path().join("build-recipe");
+        std::fs::write(
+            &by_content,
+            b"# build\nFROM alpine:3.20\nRUN apk add curl\n",
+        )
+        .unwrap();
+        assert!(looks_like_dockerfile(&by_content));
+
+        // A binary archive must not be mistaken for a Dockerfile.
+        let archive = dir.path().join("image.bin");
+        std::fs::write(&archive, [0u8, 1, 2, 0xff, b'F', b'R', b'O', b'M']).unwrap();
+        assert!(!looks_like_dockerfile(&archive));
+
+        // And resolve surfaces the build-first hint, not a flatten failure.
+        let err = stage_from_file(&dir.path().join("Dockerfile"), dir.path()).unwrap_err();
+        assert!(err.to_string().contains("build"), "{err}");
     }
 
     #[test]
