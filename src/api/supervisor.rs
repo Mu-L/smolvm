@@ -41,6 +41,10 @@ impl Supervisor {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    // Reap exited VM boot subprocesses (selective, per registered
+                    // PID) BEFORE the health check, so a just-crashed VM's zombie
+                    // is gone and `is_alive` reports it crashed this same tick.
+                    crate::process::reap_vm_children();
                     self.check_all_machines().await;
                 }
                 _ = self.shutdown_rx.changed() => {
@@ -147,6 +151,17 @@ impl Supervisor {
         // Linux: the guarded mount is a no-op.
         let lifecycle = self.state.lifecycle_lock(name);
         let _guard = lifecycle.lock().await;
+
+        // Re-check liveness now that we hold the lock. We may have queued this
+        // restart while the machine was mid-boot (an API start or an earlier
+        // restart held the lock); by the time we acquire it the boot may have
+        // completed, so re-launching would kill+reboot a healthy machine and —
+        // under concurrent boots — double the disk-prep load. If it's alive
+        // again, there's nothing to restart.
+        if self.state.is_machine_alive(name) {
+            tracing::debug!(machine = %name, "machine came back alive before restart; skipping");
+            return Ok(());
+        }
 
         let entry = match self.state.get_machine(name) {
             Ok(entry) => entry,
