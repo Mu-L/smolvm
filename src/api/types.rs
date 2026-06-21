@@ -526,6 +526,13 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 1048576)]
     pub egress_bytes: Option<u64>,
+    /// Consumed CPU-seconds (user+system) of the machine's CURRENT VMM process,
+    /// sampled live from the host. Resets to 0 on a VM restart — it's a stateless
+    /// snapshot; the control plane accumulates a durable total from it. Omitted
+    /// for stopped machines (no live process to sample).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 42)]
+    pub cpu_seconds: Option<u64>,
     /// Creation timestamp (seconds since Unix epoch).
     pub created_at: u64,
 }
