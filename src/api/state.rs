@@ -1094,6 +1094,14 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         "stopped"
     };
     let egress_bytes = crate::agent::read_egress_telemetry(&name);
+    // Live consumed CPU-seconds for the VMM child (host-sampled, resets on
+    // restart); the control plane accumulates the durable total. None when there
+    // is no live process to sample.
+    let cpu_seconds = entry
+        .manager
+        .child_pid()
+        .and_then(crate::process::process_stats)
+        .map(|s| s.cpu_time_ns / 1_000_000_000);
 
     MachineInfo {
         name,
@@ -1119,6 +1127,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         storage_gb: entry.resources.storage_gb,
         overlay_gb: entry.resources.overlay_gb,
         egress_bytes,
+        cpu_seconds,
         created_at: 0,
     }
 }

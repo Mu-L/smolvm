@@ -110,6 +110,13 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // flushes. Surfaced here so the control plane reads it from the machine
         // list exactly like disk size — no bespoke endpoint.
         egress_bytes: crate::agent::read_egress_telemetry(name),
+        // Live consumed CPU-seconds for the VMM child, sampled from the host
+        // (user+system CPU time). Resets on restart — the control plane treats it
+        // as a monotonic-with-resets counter and accumulates the durable total.
+        // `None` when stopped (pid cleared) or the process vanished mid-sample.
+        cpu_seconds: pid
+            .and_then(crate::process::process_stats)
+            .map(|s| s.cpu_time_ns / 1_000_000_000),
         created_at: record.created_at,
     }
 }
