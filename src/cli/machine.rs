@@ -473,11 +473,89 @@ pub struct RunCmd {
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
 
-/// Cache directory for baked init layers: `<cache>/smolvm/init-layers`.
-fn init_layer_cache_dir() -> smolvm::Result<PathBuf> {
-    let base = dirs::cache_dir()
-        .ok_or_else(|| smolvm::Error::config("init-layer cache", "no cache directory"))?;
-    Ok(base.join("smolvm").join("init-layers"))
+/// Cache directory for baked init layers: a sibling of the per-VM cache
+/// (`<cache>/smolvm/init-layers`), derived from the same canonical root as
+/// [`smolvm::agent::vm_cache_root`] so it shares the install's cache location.
+fn init_layer_cache_dir() -> PathBuf {
+    smolvm::agent::vm_cache_root()
+        .parent()
+        .map(|smolvm_root| smolvm_root.join("init-layers"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/smolvm-init-layers"))
+}
+
+/// Max real bytes the init-layer cache may occupy before eviction; override via
+/// `SMOLVM_INIT_CACHE_MAX_BYTES`. Default 10 GiB (~tens of layers).
+fn init_cache_max_bytes() -> u64 {
+    const DEFAULT: u64 = 10 * 1024 * 1024 * 1024;
+    std::env::var("SMOLVM_INIT_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// Evict least-recently-modified cached layers until the cache is at or below
+/// `max_bytes`, never evicting `keep` (the layer just published). Best-effort:
+/// per-entry errors are skipped. The `.smolmachine` sidecars are zstd-compressed
+/// (dense) files, so apparent length is an accurate size.
+fn prune_init_cache(dir: &Path, max_bytes: u64, keep: &Path) {
+    let mut layers: Vec<(PathBuf, std::time::SystemTime, u64)> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("smolmachine") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        layers.push((path, mtime, meta.len()));
+    }
+    let total: u64 = layers.iter().map(|(_, _, s)| *s).sum();
+    if total <= max_bytes {
+        return;
+    }
+    layers.sort_by_key(|(_, mtime, _)| *mtime); // oldest first
+    let mut over = total - max_bytes;
+    for (path, _, size) in layers {
+        if over == 0 {
+            break;
+        }
+        if path == keep {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            over = over.saturating_sub(size);
+        }
+    }
+}
+
+/// Best-effort sweep of leftover `init-bake-*` temp machines from crashed bakes.
+/// Age is taken from the DB record's `created_at` (always present — unlike the data
+/// dir, which a create-then-crash leaves absent) and gated on a generous threshold
+/// so an in-flight concurrent bake — which finishes in seconds — is never touched.
+/// Override the threshold (seconds) with `SMOLVM_INIT_BAKE_GC_SECS`.
+fn gc_stale_bake_machines(exe: &Path) {
+    let stale_after = std::env::var("SMOLVM_INIT_BAKE_GC_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(30 * 60);
+    let Ok(cfg) = smolvm::config::SmolvmConfig::load() else {
+        return;
+    };
+    let now = smolvm::util::current_timestamp();
+    let stale: Vec<String> = cfg
+        .list_vms()
+        .filter(|(name, _)| name.starts_with("init-bake-"))
+        .filter(|(_, record)| now.saturating_sub(record.created_at) >= stale_after)
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in stale {
+        let _ = run_smolvm(exe, &["machine", "delete", "--name", &name, "-f"]);
+    }
 }
 
 /// Content key for an init layer: a hash of the image + init commands + env, so the
@@ -514,7 +592,7 @@ fn ensure_init_layer(
     rebuild: bool,
 ) -> smolvm::Result<PathBuf> {
     let key = init_layer_key(params.image.as_deref(), &params.init, &params.env);
-    let dir = init_layer_cache_dir()?;
+    let dir = init_layer_cache_dir();
     std::fs::create_dir_all(&dir)
         .map_err(|e| smolvm::Error::config("init-layer cache", e.to_string()))?;
     let cached = dir.join(format!("{key}.smolmachine"));
@@ -537,6 +615,9 @@ fn ensure_init_layer(
 
     let exe = std::env::current_exe()
         .map_err(|e| smolvm::Error::config("init-layer cache", e.to_string()))?;
+    // Reap any temp machines orphaned by previously crashed bakes (age-gated so it
+    // never touches a concurrent in-flight bake).
+    gc_stale_bake_machines(&exe);
     let pid = std::process::id();
     let tmp = format!("init-bake-{key}-{pid}");
     let sf = smolfile.to_string_lossy().to_string();
@@ -607,6 +688,10 @@ fn ensure_init_layer(
     });
     let _ = std::fs::remove_dir_all(&staging);
     publish?;
+
+    // Bound the cache: evict oldest layers if we're over the cap (keeping the one
+    // just baked). Best-effort — failure to prune never fails the run.
+    prune_init_cache(&dir, init_cache_max_bytes(), &cached);
 
     println!("  ✓ baked in {}s", started.elapsed().as_secs());
     Ok(cached)
@@ -744,6 +829,17 @@ impl RunCmd {
         // `[secrets]` of the same name (CLI wins).
         for (key, r) in parse_cli_secret_refs(&self.secret_env, &self.secret_file)? {
             params.secret_refs.insert(key, r);
+        }
+
+        // Warn when caching is explicitly disabled but there's init to run: the
+        // un-baked ephemeral path runs init, but its filesystem changes are not
+        // reliably visible to the workload, so init may appear to "do nothing".
+        if self.no_init_cache && !self.detach && params.image.is_some() && !params.init.is_empty() {
+            eprintln!(
+                "warning: --no-init-cache skips baking init into a reusable layer. init still \
+                 runs, but in an un-baked ephemeral run its changes may not reach the workload. \
+                 Drop --no-init-cache to bake init once and reuse it."
+            );
         }
 
         // Init-layer cache (prototype): for an ephemeral run of an IMAGE with `init`
