@@ -1163,6 +1163,7 @@ mod tests {
             "/",
             false,
             &ProcessIdentity::root(),
+            false,
         );
 
         assert_eq!(spec.oci_version, "1.0.2");
@@ -1181,6 +1182,7 @@ mod tests {
             "/",
             true,
             &ProcessIdentity::root(),
+            false,
         );
         spec.process.console_size = Some(OciConsoleSize {
             height: 24,
@@ -1203,6 +1205,7 @@ mod tests {
             "/",
             true,
             &ProcessIdentity::root(),
+            false,
         );
         let json = serde_json::to_value(&spec).unwrap();
         assert!(
@@ -1221,6 +1224,7 @@ mod tests {
             "/",
             false,
             &ProcessIdentity::root(),
+            false,
         );
         spec.add_bind_mount("/host/path", "/container/path", true);
 
@@ -1324,6 +1328,7 @@ mod tests {
                 },
                 home: Some("/home/steam".to_string()),
             },
+            false,
         );
 
         assert!(spec.process.env.contains(&"HOME=/home/steam".to_string()));
@@ -1351,7 +1356,7 @@ mod tests {
     fn test_gpu_devices_added_when_dri_exists() {
         // On a system with /dev/dri (GPU-enabled VM), a bind mount is added
         let identity = ProcessIdentity::root();
-        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity);
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity, false);
         let mounts_before = spec.mounts.len();
         spec.add_gpu_devices_if_available();
 
@@ -1372,7 +1377,7 @@ mod tests {
     #[test]
     fn test_gpu_devices_are_not_added_twice() {
         let identity = ProcessIdentity::root();
-        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity);
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity, false);
         spec.mounts.push(super::OciMount {
             destination: "/dev/dri".to_string(),
             mount_type: Some("bind".to_string()),
@@ -1394,7 +1399,7 @@ mod tests {
     #[test]
     fn test_gpu_devices_correct_properties() {
         let identity = ProcessIdentity::root();
-        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity);
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity, false);
         // Manually push a GPU bind mount to verify expected properties
         spec.mounts.push(super::OciMount {
             destination: "/dev/dri".to_string(),
