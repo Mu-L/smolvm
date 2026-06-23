@@ -16,6 +16,7 @@ use crate::cli::parsers::{
 };
 use crate::cli::vm_common::{self, DeleteVmOptions};
 use clap::{Args, Subcommand};
+use sha2::{Digest, Sha256};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
@@ -24,7 +25,7 @@ use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::io::Write;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Resolve `--allow-cidr`, `--allow-host`, and `--outbound-localhost-only` into a CIDR list,
@@ -458,8 +459,136 @@ pub struct RunCmd {
     )]
     pub secret_file: Vec<String>,
 
+    /// Skip the init-layer cache: re-run `init` on every ephemeral run instead of
+    /// baking `image + init` once into a cached, reusable artifact. Use this when
+    /// `init` depends on live volume contents (and so cannot be safely cached).
+    #[arg(long, help_heading = "Resources")]
+    pub no_init_cache: bool,
+
+    /// Rebuild the cached init layer even if a matching one already exists.
+    #[arg(long, help_heading = "Resources")]
+    pub rebuild_init_cache: bool,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
+}
+
+/// Cache directory for baked init layers: `<cache>/smolvm/init-layers`.
+fn init_layer_cache_dir() -> smolvm::Result<PathBuf> {
+    let base = dirs::cache_dir()
+        .ok_or_else(|| smolvm::Error::config("init-layer cache", "no cache directory"))?;
+    Ok(base.join("smolvm").join("init-layers"))
+}
+
+/// Content key for an init layer: a hash of the image + init commands + env, so the
+/// cache rebuilds exactly when those inputs change.
+///
+/// PROTOTYPE LIMITATION: if `init` runs a script that lives on a mounted volume
+/// (e.g. `bash /project/init.sh`), the script's CONTENTS are not part of the key —
+/// inline the init steps into the Smolfile, or pass `--no-init-cache`.
+fn init_layer_key(params: &vm_common::CreateVmParams) -> String {
+    let mut h = Sha256::new();
+    h.update(params.image.as_deref().unwrap_or("").as_bytes());
+    h.update([0u8]);
+    for c in &params.init {
+        h.update(c.as_bytes());
+        h.update([0u8]);
+    }
+    h.update([0u8]);
+    for e in &params.env {
+        h.update(e.as_bytes());
+        h.update([0u8]);
+    }
+    hex::encode(h.finalize())[..16].to_string()
+}
+
+/// Bake `image + init` into a cached `.smolmachine` (or reuse an existing one) and
+/// return its path. Runs the well-tested `machine create/start/stop` + `pack create
+/// --from-vm` flow as subprocesses of this same binary: create a temp machine from
+/// the Smolfile with the workload replaced by a `/bin/true` no-op so only `init`
+/// runs, snapshot it, and delete the temp machine. The real workload command is
+/// supplied at run time against the resulting artifact.
+fn ensure_init_layer(
+    params: &vm_common::CreateVmParams,
+    smolfile: Option<&Path>,
+    rebuild: bool,
+) -> smolvm::Result<PathBuf> {
+    let key = init_layer_key(params);
+    let dir = init_layer_cache_dir()?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| smolvm::Error::config("init-layer cache", e.to_string()))?;
+    let cached = dir.join(format!("{key}.smolmachine"));
+    if cached.exists() && !rebuild {
+        println!("Using cached init layer {key}");
+        return Ok(cached);
+    }
+
+    let smolfile = smolfile.ok_or_else(|| {
+        smolvm::Error::config(
+            "init-layer cache",
+            "init caching requires a --smolfile (the init source); pass --no-init-cache otherwise",
+        )
+    })?;
+    println!(
+        "Baking init layer {key} ({} init step(s)) — one-time, reused on later runs...",
+        params.init.len()
+    );
+
+    let exe = std::env::current_exe()
+        .map_err(|e| smolvm::Error::config("init-layer cache", e.to_string()))?;
+    let tmp = format!("init-bake-{key}-{}", std::process::id());
+    let sf = smolfile.to_string_lossy().to_string();
+    let out = dir.join(&key).to_string_lossy().to_string(); // `pack` appends `.smolmachine`
+
+    // Clear any temp machine left by a prior failed bake (best-effort).
+    let _ = run_smolvm(&exe, &["machine", "delete", "--name", &tmp, "-f"]);
+
+    let bake = (|| -> smolvm::Result<()> {
+        // Create from the Smolfile (image + init + volumes) but replace the workload
+        // with `/bin/true`, so `start` runs init only and not the real command.
+        run_smolvm(
+            &exe,
+            &[
+                "machine",
+                "create",
+                "--name",
+                &tmp,
+                "--smolfile",
+                &sf,
+                "--",
+                "/bin/true",
+            ],
+        )?;
+        run_smolvm(&exe, &["machine", "start", "--name", &tmp])?;
+        run_smolvm(&exe, &["machine", "stop", "--name", &tmp])?;
+        run_smolvm(&exe, &["pack", "create", "--from-vm", &tmp, "-o", &out])?;
+        Ok(())
+    })();
+    let _ = run_smolvm(&exe, &["machine", "delete", "--name", &tmp, "-f"]);
+    bake?;
+
+    if !cached.exists() {
+        return Err(smolvm::Error::config(
+            "init-layer cache",
+            format!("bake did not produce {}", cached.display()),
+        ));
+    }
+    Ok(cached)
+}
+
+/// Run this same smolvm binary as a subprocess for one bake step; error on non-zero.
+fn run_smolvm(exe: &Path, args: &[&str]) -> smolvm::Result<()> {
+    let status = std::process::Command::new(exe)
+        .args(args)
+        .status()
+        .map_err(|e| smolvm::Error::config("init-layer bake", e.to_string()))?;
+    if !status.success() {
+        return Err(smolvm::Error::config(
+            "init-layer bake",
+            format!("`smolvm {}` failed ({})", args.join(" "), status),
+        ));
+    }
+    Ok(())
 }
 
 impl RunCmd {
@@ -542,7 +671,7 @@ impl RunCmd {
             vec![],
             self.env,
             self.workdir,
-            self.smolfile,
+            self.smolfile.clone(),
             self.storage,
             self.overlay,
             cli_allow_cidrs,
@@ -562,6 +691,48 @@ impl RunCmd {
         for (key, r) in parse_cli_secret_refs(&self.secret_env, &self.secret_file)? {
             params.secret_refs.insert(key, r);
         }
+
+        // Init-layer cache (prototype): for an ephemeral run of an IMAGE with `init`
+        // commands, bake `image + init` once into a cached `.smolmachine` and run from
+        // that artifact, so init's cost (e.g. `apt install`) is paid once and reused
+        // on every later run instead of re-running on each ephemeral boot. Skipped for
+        // detached/persistent runs (`-d`) and when `--no-init-cache` is set.
+        if !self.no_init_cache && !self.detach && params.image.is_some() && !params.init.is_empty()
+        {
+            let cached =
+                ensure_init_layer(&params, self.smolfile.as_deref(), self.rebuild_init_cache)?;
+            // The real workload: CLI trailing args win, else the Smolfile's
+            // entrypoint+cmd (the baked artifact's own command is a `/bin/true` no-op).
+            let command = if !self.command.is_empty() {
+                self.command.clone()
+            } else {
+                let mut c = params.entrypoint.clone();
+                c.extend(params.cmd.clone());
+                c
+            };
+            return crate::cli::pack_run::PackRunCmd {
+                sidecar: Some(cached),
+                command,
+                interactive: self.interactive,
+                tty: self.tty,
+                timeout: self.timeout,
+                workdir: params.workdir.clone(),
+                env: params.env.clone(),
+                volume: params.volume.clone(),
+                port: params.port.clone(),
+                net: params.net,
+                net_backend: params.network_backend,
+                cpus: (params.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(params.cpus),
+                mem: (params.mem != DEFAULT_MICROVM_MEMORY_MIB).then_some(params.mem),
+                storage: params.storage_gb,
+                overlay: params.overlay_gb,
+                force_extract: false,
+                info: false,
+                debug: false,
+            }
+            .run();
+        }
+
         let mut mounts = HostMount::parse(&params.volume)?;
         let ports = params.port.clone();
         PortMapping::check_duplicates(&ports)
@@ -1761,7 +1932,7 @@ impl CreateCmd {
             self.init,
             self.env,
             self.workdir,
-            self.smolfile,
+            self.smolfile.clone(),
             self.storage,
             self.overlay,
             cli_allow_cidrs,
