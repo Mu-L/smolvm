@@ -475,12 +475,15 @@ impl OciSpec {
         }
         env_strings.extend(env.iter().map(|(k, v)| format!("{}={}", k, v)));
 
-        // Default capabilities for root containers
+        // VM-grade capabilities: the microVM is the security boundary, so the
+        // in-VM workload gets a full capability set (see `full_capabilities`). This
+        // is what lets init systems (systemd as PID 1) and tmpfs-mounting workloads
+        // run — the README's "boot any image" promise.
         let capabilities = OciCapabilities {
-            bounding: default_capabilities(),
-            effective: default_capabilities(),
+            bounding: full_capabilities(),
+            effective: full_capabilities(),
             inheritable: vec![],
-            permitted: default_capabilities(),
+            permitted: full_capabilities(),
             ambient: vec![],
         };
 
@@ -804,6 +807,8 @@ pub fn generate_container_id() -> String {
 }
 
 /// Default Linux capabilities for root containers.
+// Retained as the fallback for a future opt-in unprivileged mode (`--unprivileged`).
+#[allow(dead_code)]
 fn default_capabilities() -> Vec<String> {
     vec![
         "CAP_CHOWN".to_string(),
@@ -821,6 +826,62 @@ fn default_capabilities() -> Vec<String> {
         "CAP_KILL".to_string(),
         "CAP_AUDIT_WRITE".to_string(),
     ]
+}
+
+/// Full capability set for a "VM-grade" workload. smolvm runs one workload per
+/// microVM, so the KVM boundary — not the in-VM container — is the security
+/// boundary; dropping capabilities here protects nothing (an escape lands in the
+/// VM's own single-tenant kernel) while breaking legitimate images that expect a
+/// real machine (systemd/OpenRC as PID 1, or anything that mounts a tmpfs). So the
+/// default container is effectively privileged. An opt-in unprivileged mode can
+/// fall back to [`default_capabilities`] for defense-in-depth with untrusted code.
+fn full_capabilities() -> Vec<String> {
+    [
+        "CAP_AUDIT_CONTROL",
+        "CAP_AUDIT_READ",
+        "CAP_AUDIT_WRITE",
+        "CAP_BLOCK_SUSPEND",
+        "CAP_BPF",
+        "CAP_CHECKPOINT_RESTORE",
+        "CAP_CHOWN",
+        "CAP_DAC_OVERRIDE",
+        "CAP_DAC_READ_SEARCH",
+        "CAP_FOWNER",
+        "CAP_FSETID",
+        "CAP_IPC_LOCK",
+        "CAP_IPC_OWNER",
+        "CAP_KILL",
+        "CAP_LEASE",
+        "CAP_LINUX_IMMUTABLE",
+        "CAP_MAC_ADMIN",
+        "CAP_MAC_OVERRIDE",
+        "CAP_MKNOD",
+        "CAP_NET_ADMIN",
+        "CAP_NET_BIND_SERVICE",
+        "CAP_NET_BROADCAST",
+        "CAP_NET_RAW",
+        "CAP_PERFMON",
+        "CAP_SETFCAP",
+        "CAP_SETGID",
+        "CAP_SETPCAP",
+        "CAP_SETUID",
+        "CAP_SYS_ADMIN",
+        "CAP_SYS_BOOT",
+        "CAP_SYS_CHROOT",
+        "CAP_SYS_MODULE",
+        "CAP_SYS_NICE",
+        "CAP_SYS_PACCT",
+        "CAP_SYS_PTRACE",
+        "CAP_SYS_RAWIO",
+        "CAP_SYS_RESOURCE",
+        "CAP_SYS_TIME",
+        "CAP_SYS_TTY_CONFIG",
+        "CAP_SYSLOG",
+        "CAP_WAKE_ALARM",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// Default device nodes for container execution.
@@ -965,7 +1026,8 @@ fn default_mounts() -> Vec<OciMount> {
                 "ro".to_string(),
             ],
         },
-        // /sys/fs/cgroup - cgroup filesystem (read-only)
+        // /sys/fs/cgroup - cgroup2, writable so an init system (systemd) can manage
+        // its own cgroup subtree. Safe: the VM is the boundary and is single-tenant.
         OciMount {
             destination: "/sys/fs/cgroup".to_string(),
             mount_type: Some("cgroup2".to_string()),
@@ -974,7 +1036,44 @@ fn default_mounts() -> Vec<OciMount> {
                 "nosuid".to_string(),
                 "noexec".to_string(),
                 "nodev".to_string(),
-                "ro".to_string(),
+                "rw".to_string(),
+            ],
+        },
+        // /run, /run/lock, /tmp - tmpfs that init systems and many services expect
+        // to set up at boot. Pre-providing them means the workload doesn't have to
+        // mount them itself (and lets read-only-rootfs images still have writable
+        // runtime dirs).
+        OciMount {
+            destination: "/run".to_string(),
+            mount_type: Some("tmpfs".to_string()),
+            source: "tmpfs".to_string(),
+            options: vec![
+                "nosuid".to_string(),
+                "nodev".to_string(),
+                "mode=0755".to_string(),
+                "size=65536k".to_string(),
+            ],
+        },
+        OciMount {
+            destination: "/run/lock".to_string(),
+            mount_type: Some("tmpfs".to_string()),
+            source: "tmpfs".to_string(),
+            options: vec![
+                "nosuid".to_string(),
+                "nodev".to_string(),
+                "noexec".to_string(),
+                "mode=1777".to_string(),
+                "size=5120k".to_string(),
+            ],
+        },
+        OciMount {
+            destination: "/tmp".to_string(),
+            mount_type: Some("tmpfs".to_string()),
+            source: "tmpfs".to_string(),
+            options: vec![
+                "nosuid".to_string(),
+                "nodev".to_string(),
+                "mode=1777".to_string(),
             ],
         },
     ]
