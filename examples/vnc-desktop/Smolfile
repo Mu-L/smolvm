@@ -1,0 +1,9 @@
+# A warm GUI desktop served over VNC, for computer-use / GUI-agent workloads.
+# Pair with `machine start --forkable` so each episode can fork an instant,
+# pixel-live clone (see README).
+image = "ubuntu:noble"
+net = true
+
+[dev]
+init = ["bash /work/setup.sh"]
+volumes = [".:/work"]
