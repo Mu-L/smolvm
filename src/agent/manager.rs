@@ -152,6 +152,13 @@ struct AgentInner {
     config_state: ConfigState,
     /// If true, the agent has been detached and should not be stopped on drop.
     detached: bool,
+    /// True for the most recent launch via a fork snapshot. A clone resumes past
+    /// boot and never (re)writes the `.smolvm-ready` marker, so `wait_for_ready`
+    /// must detect readiness by pinging the restored agent instead. Set per-launch
+    /// in `start_via_subprocess` from `LaunchFeatures.snapshot_dir` — this carries
+    /// the flag without a process-global env var (unsafe in the multithreaded
+    /// `serve` process where concurrent forks would race).
+    is_clone: bool,
     /// Held while the VM is running. Released on stop/Drop to allow other
     /// processes to start the VM. The kernel releases the lock automatically
     /// if the process crashes.
@@ -502,6 +509,7 @@ impl AgentManager {
                 resources: VmResources::default(),
                 config_state: ConfigState::Unknown,
                 detached: false,
+                is_clone: false,
                 #[cfg(unix)]
                 vm_lock_handle: None,
             })),
@@ -1472,6 +1480,26 @@ impl AgentManager {
             .overlay_gib
             .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
 
+        // Forkable / fork-clone launch params are carried PER-PROCESS — set on
+        // the boot subprocess's own env below (and on `self.is_clone`), never via
+        // `std::env::set_var`. A process-global env var is a data race in the
+        // multithreaded `serve` process, where concurrent forks would clobber
+        // each other (and `set_var` is `unsafe` in edition 2024 for that reason).
+        let fork_env: Vec<(&str, String)> = {
+            let mut v = Vec::new();
+            if features.forkable {
+                v.push(("SMOLVM_FORKABLE", "1".to_string()));
+            }
+            if let Some(ref ctl) = features.control_socket {
+                v.push(("SMOLVM_CONTROL_SOCKET", ctl.to_string_lossy().into_owned()));
+            }
+            if let Some(ref snap) = features.snapshot_dir {
+                v.push(("SMOLVM_SNAPSHOT_DIR", snap.to_string_lossy().into_owned()));
+            }
+            v
+        };
+        self.inner.lock().is_clone = features.snapshot_dir.is_some();
+
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
             rootfs_path: self.rootfs_path.clone(),
@@ -1529,6 +1557,9 @@ impl AgentManager {
                 "SMOLVM_BOOT_WATCH_PARENT",
                 if watch_parent { "1" } else { "0" },
             )
+            // Forkable / fork-clone vars set explicitly on the child (not via
+            // inherited process-global env) — see fork_env above.
+            .envs(fork_env)
             .stdin(std::process::Stdio::null())
             // SMOLVM_BOOT_DEBUG=1 surfaces the boot subprocess's stdout/stderr so
             // embedded-host launch failures can be diagnosed (normally silenced).
@@ -1919,7 +1950,7 @@ impl AgentManager {
         // Fork clone: the guest resumes past boot, so it never (re)writes the
         // `.smolvm-ready` marker. Detect readiness by pinging the restored agent
         // directly (it is already in its accept loop) — no marker, no grace.
-        let is_clone = std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some_and(|v| !v.is_empty());
+        let is_clone = self.inner.lock().is_clone;
         if is_clone {
             while start.elapsed() < timeout {
                 {
