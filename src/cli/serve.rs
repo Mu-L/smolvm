@@ -152,6 +152,30 @@ impl ServeStartCmd {
             }
         }
 
+        // Per-VM uid isolation preflight. When serve is privileged each VMM drops
+        // to its own unprivileged uid (process::vm_drop_ids), containing a
+        // guest→VMM escape to one VM. That only works if the data root is
+        // traversable (others-execute) by the drop uid — an XDG-under-a-700-home
+        // layout is not, and the VMM would die with a cryptic readiness timeout.
+        // Warn loudly with the fix instead. Opt out with SMOLVM_VM_UID_DROP=off.
+        #[cfg(target_os = "linux")]
+        if smolvm::process::vm_uid_drop_active() {
+            let cache_root = smolvm::agent::vm_cache_root();
+            match smolvm::process::first_nontraversable_ancestor(&cache_root) {
+                Some(blocker) => tracing::warn!(
+                    blocker = %blocker.display(),
+                    "per-VM uid isolation is active but {b} is not traversable (o+x) by \
+                     unprivileged uids — VMMs will fail to start. Use a world-traversable data \
+                     root (e.g. run serve with HOME=/var/lib/smolvm) or `chmod o+x {b}`, or \
+                     disable with SMOLVM_VM_UID_DROP=off",
+                    b = blocker.display(),
+                ),
+                None => tracing::info!(
+                    "per-VM uid isolation active (each VMM drops to its own unprivileged uid)"
+                ),
+            }
+        }
+
         // Create the runtime with signal handling enabled
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()

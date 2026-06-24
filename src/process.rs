@@ -138,6 +138,23 @@ pub fn harden_self() {
     }
 }
 
+/// (Re)assert the process's `PR_SET_DUMPABLE` flag.
+///
+/// `setuid()` clears dumpable, after which `ptrace_may_access` denies even a
+/// same-uid reader of `/proc/<pid>/{mem,fd}` without `CAP_SYS_PTRACE`. A forkable
+/// golden's clones map its guest-RAM memfd via `/proc/<golden>/fd`, so the
+/// forkable boot re-asserts dumpable *after* its per-VM uid drop — without this,
+/// fork breaks under uid isolation. Only the golden's own uid (under per-VM uids,
+/// exactly its clones) can reach it. Linux-only; no-op elsewhere.
+#[cfg(target_os = "linux")]
+pub fn set_dumpable(dumpable: bool) {
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, i32::from(dumpable), 0, 0, 0) };
+}
+
+/// No-op where `prctl` isn't applicable (macOS dev).
+#[cfg(not(target_os = "linux"))]
+pub fn set_dumpable(_dumpable: bool) {}
+
 // ============================================================================
 // Per-VM cgroup v2 resource caps (noisy-neighbor / host-DoS containment)
 //
@@ -581,6 +598,136 @@ pub fn drop_privileges(uid: u32, gid: u32) -> std::result::Result<(), String> {
 /// No-op stub where privilege dropping isn't applicable (macOS dev).
 #[cfg(not(target_os = "linux"))]
 pub fn drop_privileges(_uid: u32, _gid: u32) -> std::result::Result<(), String> {
+    Ok(())
+}
+
+// ============================================================================
+// Per-VM uid allocation (defense-in-depth for a guest→VMM escape)
+//
+// When the launcher runs privileged (root `serve`), each VMM is dropped to its
+// own dedicated unprivileged uid so a guest→VMM escape is contained to that one
+// VM: it can't ptrace/read other tenants' VMMs (different uid), reach their
+// disks (different ownership), or touch root/host files. The uid is derived
+// deterministically from the VM's data dir (stable across restarts, no
+// allocation state), mapped into a high range well clear of system, regular,
+// `nobody`, and systemd-DynamicUser uids. A fork clone uses its GOLDEN's uid so
+// it can map the golden's guest-RAM memfd via /proc/<golden>/fd (same uid).
+// ============================================================================
+
+/// Base of the reserved per-VM uid range. Above normal system (<1000), user
+/// (1000–60000), `nobody` (65534), and systemd DynamicUser (61184–65519) uids.
+const VM_UID_BASE: u32 = 2_000_000;
+/// Span of the per-VM uid range: uids land in `[BASE, BASE+SPAN)`. Wide enough
+/// that birthday collisions need thousands of concurrent VMs (a collision only
+/// weakens cross-VM isolation between the two colliding VMs, never correctness).
+const VM_UID_SPAN: u32 = 100_000_000;
+
+/// Whether per-VM uid isolation applies here: the launcher is privileged (so it
+/// can chown + setuid) and the operator hasn't opted out with
+/// `SMOLVM_VM_UID_DROP=off`.
+#[cfg(target_os = "linux")]
+pub fn vm_uid_drop_active() -> bool {
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let opted_out =
+        std::env::var_os("SMOLVM_VM_UID_DROP").as_deref() == Some(std::ffi::OsStr::new("off"));
+    is_root && !opted_out
+}
+
+/// No-op where the uid drop isn't applicable (macOS dev).
+#[cfg(not(target_os = "linux"))]
+pub fn vm_uid_drop_active() -> bool {
+    false
+}
+
+/// Per-VM uid isolation needs every ancestor of the data root to be traversable
+/// (others-execute) by the drop uid, or the dropped VMM can't reach its own
+/// files (it fails with a cryptic readiness timeout). Returns the first ancestor
+/// of `path` (walking up) that a non-owner can't traverse, or `None` if the whole
+/// chain is fine. `serve` uses it to warn the operator up front.
+#[cfg(target_os = "linux")]
+pub fn first_nontraversable_ancestor(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut cur = Some(path);
+    while let Some(dir) = cur {
+        if let Ok(meta) = std::fs::metadata(dir) {
+            if meta.is_dir() && meta.permissions().mode() & 0o001 == 0 {
+                return Some(dir.to_path_buf());
+            }
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+/// No-op where the uid drop isn't applicable (macOS dev).
+#[cfg(not(target_os = "linux"))]
+pub fn first_nontraversable_ancestor(_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Deterministic per-VM uid from a data dir whose basename is the 16-hex VM
+/// hash. Falls back to the base uid if the name isn't hex (never panics).
+pub fn vm_uid_for_dir(data_dir: &std::path::Path) -> u32 {
+    let name = data_dir.file_name().and_then(|n| n.to_str()).unwrap_or("0");
+    let prefix = name.get(..8).unwrap_or(name);
+    let v = u32::from_str_radix(prefix, 16).unwrap_or(0);
+    VM_UID_BASE + (v % VM_UID_SPAN)
+}
+
+/// The `(uid, gid)` a VM's VMM should drop to, or `None` when the uid drop
+/// doesn't apply (unprivileged launcher, or `SMOLVM_VM_UID_DROP=off`). For a
+/// fork clone (`snapshot_dir` set, laid out as `<golden_dir>/fork-snapshots/
+/// <clone>`), the id is derived from the GOLDEN's dir so the clone shares the
+/// golden's uid and can map its memfd. gid mirrors uid (a per-VM group).
+#[cfg(target_os = "linux")]
+pub fn vm_drop_ids(
+    data_dir: &std::path::Path,
+    snapshot_dir: Option<&std::path::Path>,
+) -> Option<(u32, u32)> {
+    if !vm_uid_drop_active() {
+        return None;
+    }
+    let uid_dir = match snapshot_dir {
+        Some(snap) => snap.parent().and_then(|p| p.parent()).unwrap_or(data_dir),
+        None => data_dir,
+    };
+    let uid = vm_uid_for_dir(uid_dir);
+    Some((uid, uid))
+}
+
+/// No-op where the uid drop isn't applicable (macOS dev).
+#[cfg(not(target_os = "linux"))]
+pub fn vm_drop_ids(
+    _data_dir: &std::path::Path,
+    _snapshot_dir: Option<&std::path::Path>,
+) -> Option<(u32, u32)> {
+    None
+}
+
+/// Recursively `lchown` `path` to `(uid, gid)` (symlinks not followed). Used by
+/// the privileged launcher to hand a VM's data dir + disks + sockets to the uid
+/// its VMM will drop to. Linux-only; the caller is root.
+#[cfg(target_os = "linux")]
+pub fn chown_tree(path: &std::path::Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if unsafe { libc::lchown(c.as_ptr(), uid, gid) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Recurse into real directories only (not symlinked ones).
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            chown_tree(&entry?.path(), uid, gid)?;
+        }
+    }
+    Ok(())
+}
+
+/// No-op where chown isn't applicable (macOS dev).
+#[cfg(not(target_os = "linux"))]
+pub fn chown_tree(_path: &std::path::Path, _uid: u32, _gid: u32) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1807,6 +1954,39 @@ mod tests {
             1,
             "drop must not have taken effect"
         );
+    }
+
+    #[test]
+    fn vm_uid_is_deterministic_and_in_reserved_range() {
+        let d = std::path::Path::new("/cache/vms/78f42d8fd6d4a576");
+        let u = vm_uid_for_dir(d);
+        assert_eq!(
+            u,
+            vm_uid_for_dir(d),
+            "uid must be stable for a given VM dir"
+        );
+        assert!(
+            (VM_UID_BASE..VM_UID_BASE + VM_UID_SPAN).contains(&u),
+            "uid {u} outside the reserved range"
+        );
+        // Distinct VMs (almost always) get distinct uids.
+        assert_ne!(
+            vm_uid_for_dir(std::path::Path::new("/cache/vms/78f42d8fd6d4a576")),
+            vm_uid_for_dir(std::path::Path::new("/cache/vms/aaaaaaaaaaaaaaaa")),
+        );
+        // A non-hex basename must not panic.
+        let _ = vm_uid_for_dir(std::path::Path::new("/cache/vms/not-hex-name"));
+    }
+
+    #[test]
+    fn clone_uid_matches_its_golden() {
+        // A clone's snapshot dir is `<golden_dir>/fork-snapshots/<clone>`. Its uid
+        // must equal the golden's (so it can map the golden's memfd), i.e. the
+        // derivation two levels up from the snapshot dir == the golden's dir uid.
+        let golden = std::path::Path::new("/cache/vms/78f42d8fd6d4a576");
+        let snap = golden.join("fork-snapshots").join("myclone");
+        let derived = vm_uid_for_dir(snap.parent().unwrap().parent().unwrap());
+        assert_eq!(derived, vm_uid_for_dir(golden));
     }
 
     /// The boot gate hands out permits, returns them on drop, and lets multiple

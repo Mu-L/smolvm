@@ -154,6 +154,12 @@ pub fn prepare_fork(
     let snapshot_dir = gdir.join("fork-snapshots").join(clone);
     std::fs::create_dir_all(&snapshot_dir)
         .map_err(|e| Error::agent("create snapshot dir", e.to_string()))?;
+    // Under per-VM uid isolation (privileged launcher) the frozen golden VMM runs
+    // as its own unprivileged uid and writes the snapshot here via the FORK
+    // command below, so hand this dir to that uid. No-op unless privileged.
+    if let Some((uid, gid)) = crate::process::vm_drop_ids(&gdir, None) {
+        let _ = crate::process::chown_tree(&snapshot_dir, uid, gid);
+    }
 
     // Register the clone in the DB with the golden's config, no running-state,
     // and its port forwards remapped to fresh host ports. With the default TSI

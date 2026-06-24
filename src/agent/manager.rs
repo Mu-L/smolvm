@@ -1351,6 +1351,28 @@ impl AgentManager {
         let _ = std::fs::remove_file(&ready_marker);
         let _ = std::fs::remove_file(&self.startup_error_log);
 
+        // Per-VM uid isolation: the VMM drops to an unprivileged uid that can't
+        // write the shared, host-user-owned agent rootfs, so the guest's
+        // readiness-marker write (and the Landlock pre-create) would fail and
+        // readiness would limp to the slow vsock fallback. We're root here, so
+        // pre-create the marker world-writable; the dropped guest overwrites it
+        // with content. It already lives in a host-user-writable dir, so 0666
+        // doesn't meaningfully widen exposure. No-op unless the uid drop applies.
+        #[cfg(target_os = "linux")]
+        if let Some(data_dir) = self.storage_disk.path().parent() {
+            if crate::process::vm_drop_ids(data_dir, None).is_some() {
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .mode(0o666)
+                    .open(&ready_marker);
+                let _ =
+                    std::fs::set_permissions(&ready_marker, std::fs::Permissions::from_mode(0o666));
+            }
+        }
+
         Ok(())
     }
 
@@ -1500,6 +1522,30 @@ impl AgentManager {
         };
         self.inner.lock().is_clone = features.snapshot_dir.is_some();
 
+        // Per-VM uid isolation: when running privileged (root `serve`), give this
+        // VMM its own dedicated unprivileged uid so a guest→VMM escape is contained
+        // to one VM. We're still root here, so chown the VM's data dir (disks,
+        // sockets, logs) to that uid; `internal_boot` does the actual setuid drop
+        // from the inherited SMOLVM_VM_UID. A fork clone shares its golden's uid
+        // (vm_drop_ids derives it from the snapshot path) so it can map the
+        // golden's memfd. No-op unless privileged; opt out with
+        // SMOLVM_VM_UID_DROP=off. See process::vm_drop_ids.
+        let data_dir = self.storage_disk.path().parent().map(|p| p.to_path_buf());
+        let uid_env: Vec<(&str, String)> = match data_dir.as_deref().and_then(|d| {
+            crate::process::vm_drop_ids(d, features.snapshot_dir.as_deref()).map(|ids| (d, ids))
+        }) {
+            Some((d, (uid, gid))) => {
+                crate::process::chown_tree(d, uid, gid)
+                    .map_err(|e| Error::agent("chown vm data dir for uid drop", e.to_string()))?;
+                tracing::info!(uid, vm_dir = %d.display(), "per-VM uid isolation enabled");
+                vec![
+                    ("SMOLVM_VM_UID", uid.to_string()),
+                    ("SMOLVM_VM_GID", gid.to_string()),
+                ]
+            }
+            None => Vec::new(),
+        };
+
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
             rootfs_path: self.rootfs_path.clone(),
@@ -1560,6 +1606,8 @@ impl AgentManager {
             // Forkable / fork-clone vars set explicitly on the child (not via
             // inherited process-global env) — see fork_env above.
             .envs(fork_env)
+            // Per-VM uid drop (privileged launcher only) — see uid_env above.
+            .envs(uid_env)
             .stdin(std::process::Stdio::null())
             // SMOLVM_BOOT_DEBUG=1 surfaces the boot subprocess's stdout/stderr so
             // embedded-host launch failures can be diagnosed (normally silenced).

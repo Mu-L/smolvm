@@ -158,6 +158,15 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             eprintln!("[uid-drop] failed, refusing to boot over-privileged: {e}");
             smolvm::process::exit_child(1);
         }
+        // The setuid above clears the dumpable flag. A forkable golden's clones
+        // map its guest-RAM memfd via /proc/<golden>/fd, which ptrace_may_access
+        // denies on a non-dumpable target even at a uid match — so re-assert
+        // dumpable here (after the drop) for a forkable VM, or fork breaks under
+        // per-VM uid isolation. See process::set_dumpable.
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("SMOLVM_FORKABLE").is_some() {
+            smolvm::process::set_dumpable(true);
+        }
     }
 
     // A fork clone restores by mapping the golden's guest-RAM memfd, opened via
