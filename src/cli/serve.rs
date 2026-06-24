@@ -95,6 +95,14 @@ impl ServeStartCmd {
             std::env::set_var("SMOLVM_LOG_FORMAT", "json");
         }
 
+        // Data root. Per-VM uid isolation needs every smolvm path traversable by
+        // the dropped uids; XDG-under-a-700-home isn't, a system data root is.
+        // serve additionally auto-defaults to /var/lib/smolvm when privileged
+        // (allow_auto = true). An explicit SMOLVM_DATA_DIR was already applied for
+        // every command in main(); calling again is idempotent. Single-threaded
+        // before the tokio runtime, so set_var is safe.
+        smolvm::process::apply_system_data_root(/* allow_auto */ true);
+
         let listen_target = ListenTarget::parse(&self.listen)?;
 
         // Set up verbose logging if requested

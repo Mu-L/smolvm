@@ -1498,6 +1498,9 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     let data_dir = vm_data_dir(name);
     if data_dir.exists() {
         println!("Cleaning up data directory for vm: {}", name);
+        // Release this VM's per-VM uid (if any) before the dir holding its
+        // `.vm-uid` record is removed. See process::free_vm_uid.
+        smolvm::process::free_vm_uid(&smolvm::agent::vm_uid_registry_dir(), &data_dir);
         if let Err(e) = std::fs::remove_dir_all(&data_dir) {
             tracing::warn!(error = %e, "Failed to remove VM data directory: {}", data_dir.display());
         }

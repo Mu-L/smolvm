@@ -307,6 +307,16 @@ pub fn vm_cache_root() -> PathBuf {
         .join("vms")
 }
 
+/// Per-node registry for the collision-free per-VM uid allocator
+/// (`<cache_dir>/smolvm/uids/`), a sibling of the VM data dirs. Root-managed; the
+/// dropped VMMs never touch it. See `process::allocate_vm_uid`.
+pub fn vm_uid_registry_dir() -> PathBuf {
+    vm_cache_root()
+        .parent()
+        .map(|p| p.join("uids"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/smolvm-uids"))
+}
+
 /// Compute the 16-hex-char directory name for a VM.
 ///
 /// Uses SHA-256 truncated to 8 bytes. The specific hash function doesn't
@@ -1359,18 +1369,15 @@ impl AgentManager {
         // with content. It already lives in a host-user-writable dir, so 0666
         // doesn't meaningfully widen exposure. No-op unless the uid drop applies.
         #[cfg(target_os = "linux")]
-        if let Some(data_dir) = self.storage_disk.path().parent() {
-            if crate::process::vm_drop_ids(data_dir, None).is_some() {
-                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-                let _ = std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .mode(0o666)
-                    .open(&ready_marker);
-                let _ =
-                    std::fs::set_permissions(&ready_marker, std::fs::Permissions::from_mode(0o666));
-            }
+        if crate::process::vm_uid_drop_active() {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o666)
+                .open(&ready_marker);
+            let _ = std::fs::set_permissions(&ready_marker, std::fs::Permissions::from_mode(0o666));
         }
 
         Ok(())
@@ -1523,20 +1530,28 @@ impl AgentManager {
         self.inner.lock().is_clone = features.snapshot_dir.is_some();
 
         // Per-VM uid isolation: when running privileged (root `serve`), give this
-        // VMM its own dedicated unprivileged uid so a guest→VMM escape is contained
-        // to one VM. We're still root here, so chown the VM's data dir (disks,
-        // sockets, logs) to that uid; `internal_boot` does the actual setuid drop
-        // from the inherited SMOLVM_VM_UID. A fork clone shares its golden's uid
-        // (vm_drop_ids derives it from the snapshot path) so it can map the
-        // golden's memfd. No-op unless privileged; opt out with
-        // SMOLVM_VM_UID_DROP=off. See process::vm_drop_ids.
+        // VMM its own dedicated, collision-free unprivileged uid so a guest→VMM
+        // escape is contained to one VM. We're still root here, so chown the VM's
+        // data dir (disks, sockets, logs) to that uid and tighten it to 0700 (so
+        // a sibling VM's uid — or a Landlock-exempt clone — can't read its disks);
+        // `internal_boot` does the actual setuid drop from the inherited
+        // SMOLVM_VM_UID. A fork clone shares its golden's uid (resolved from the
+        // snapshot path) so it can map the golden's memfd. No-op unless privileged;
+        // opt out with SMOLVM_VM_UID_DROP=off. See process::vm_drop_ids.
         let data_dir = self.storage_disk.path().parent().map(|p| p.to_path_buf());
+        let registry = vm_uid_registry_dir();
         let uid_env: Vec<(&str, String)> = match data_dir.as_deref().and_then(|d| {
-            crate::process::vm_drop_ids(d, features.snapshot_dir.as_deref()).map(|ids| (d, ids))
+            crate::process::vm_drop_ids(&registry, d, features.snapshot_dir.as_deref())
+                .map(|ids| (d, ids))
         }) {
             Some((d, (uid, gid))) => {
                 crate::process::chown_tree(d, uid, gid)
                     .map_err(|e| Error::agent("chown vm data dir for uid drop", e.to_string()))?;
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700));
+                }
                 tracing::info!(uid, vm_dir = %d.display(), "per-VM uid isolation enabled");
                 vec![
                     ("SMOLVM_VM_UID", uid.to_string()),
@@ -1864,6 +1879,11 @@ impl AgentManager {
     pub fn cleanup_data_dir(&self) {
         if let Some(ref name) = self.name {
             let dir = vm_data_dir(name);
+            // Release this VM's per-VM uid (if any) back to the allocator before
+            // the dir — which holds the `.vm-uid` record — is removed. A fork
+            // clone has no uid of its own (it shares its golden's), so this is a
+            // no-op for it. See process::free_vm_uid.
+            crate::process::free_vm_uid(&vm_uid_registry_dir(), &dir);
             if dir.exists() {
                 if let Err(e) = std::fs::remove_dir_all(&dir) {
                     tracing::debug!(

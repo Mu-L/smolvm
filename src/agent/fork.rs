@@ -157,7 +157,9 @@ pub fn prepare_fork(
     // Under per-VM uid isolation (privileged launcher) the frozen golden VMM runs
     // as its own unprivileged uid and writes the snapshot here via the FORK
     // command below, so hand this dir to that uid. No-op unless privileged.
-    if let Some((uid, gid)) = crate::process::vm_drop_ids(&gdir, None) {
+    if let Some((uid, gid)) =
+        crate::process::vm_drop_ids(&crate::agent::vm_uid_registry_dir(), &gdir, None)
+    {
         let _ = crate::process::chown_tree(&snapshot_dir, uid, gid);
     }
 
