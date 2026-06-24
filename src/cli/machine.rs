@@ -2437,7 +2437,9 @@ impl StartCmd {
         } else {
             vm_common::ForkLaunch::default()
         };
-        match vm_common::start_vm_named(&name, proxy, no_proxy, /* from_snapshot */ false, fork) {
+        match vm_common::start_vm_named(
+            &name, proxy, no_proxy, /* from_snapshot */ false, fork,
+        ) {
             Ok(()) => Ok(()),
             Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
                 // Only fall back to creating a default VM when no --name was given.
