@@ -5,6 +5,7 @@
 
 pub mod boot_config;
 mod client;
+pub mod fork;
 mod krun;
 mod launcher;
 pub mod launcher_dynamic;
