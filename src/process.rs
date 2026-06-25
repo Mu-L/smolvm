@@ -796,9 +796,16 @@ pub fn free_vm_uid(registry_dir: &std::path::Path, key_dir: &std::path::Path) {
 #[cfg(not(target_os = "linux"))]
 pub fn free_vm_uid(_registry_dir: &std::path::Path, _key_dir: &std::path::Path) {}
 
-/// The `(uid, gid)` a VM's VMM should drop to — allocated **collision-free** from
-/// `registry_dir` — or `None` when the drop doesn't apply (unprivileged launcher,
-/// or `SMOLVM_VM_UID_DROP=off`). A fork clone (`snapshot_dir` set, laid out as
+/// The `(uid, gid)` a VM's VMM should drop to, allocated **collision-free** from
+/// `registry_dir`. Returns:
+/// - `None` — the drop doesn't apply (unprivileged launcher, or
+///   `SMOLVM_VM_UID_DROP=off`); boot proceeds without a drop.
+/// - `Some(Err(_))` — the drop is **active but allocation failed**; the caller
+///   MUST refuse to boot (fail closed — never silently run the VMM over-
+///   privileged, the same contract as `drop_privileges`).
+/// - `Some(Ok((uid, gid)))` — drop to this id.
+///
+/// A fork clone (`snapshot_dir` set, laid out as
 /// `<golden_dir>/fork-snapshots/<clone>`) resolves to the GOLDEN's uid so it can
 /// map the golden's memfd. gid mirrors uid (a per-VM group).
 #[cfg(target_os = "linux")]
@@ -806,7 +813,7 @@ pub fn vm_drop_ids(
     registry_dir: &std::path::Path,
     data_dir: &std::path::Path,
     snapshot_dir: Option<&std::path::Path>,
-) -> Option<(u32, u32)> {
+) -> Option<std::io::Result<(u32, u32)>> {
     if !vm_uid_drop_active() {
         return None;
     }
@@ -814,9 +821,13 @@ pub fn vm_drop_ids(
         Some(snap) => snap.parent().and_then(|p| p.parent()).unwrap_or(data_dir),
         None => data_dir,
     };
-    let vm_key = key_dir.file_name()?.to_str()?;
-    let uid = allocate_vm_uid(registry_dir, key_dir, vm_key).ok()?;
-    Some((uid, uid))
+    let Some(vm_key) = key_dir.file_name().and_then(|n| n.to_str()) else {
+        return Some(Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "VM data dir name is not valid UTF-8",
+        )));
+    };
+    Some(allocate_vm_uid(registry_dir, key_dir, vm_key).map(|uid| (uid, uid)))
 }
 
 /// No-op where the uid drop isn't applicable (macOS dev).
@@ -825,9 +836,36 @@ pub fn vm_drop_ids(
     _registry_dir: &std::path::Path,
     _data_dir: &std::path::Path,
     _snapshot_dir: Option<&std::path::Path>,
-) -> Option<(u32, u32)> {
+) -> Option<std::io::Result<(u32, u32)>> {
     None
 }
+
+/// Add others-execute to `dir` and every ancestor that lacks it, so a dropped
+/// VMM uid can traverse to it. Execute-only (no read): traversal works but the
+/// dirs can't be listed and file contents stay governed by their own perms.
+/// Used under uid isolation for the data/rootfs/template path chains. Idempotent,
+/// best-effort. Linux-only.
+#[cfg(target_os = "linux")]
+pub fn ensure_traversable(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.as_os_str().is_empty() {
+            break;
+        }
+        if let Ok(meta) = std::fs::metadata(d) {
+            let mode = meta.permissions().mode();
+            if meta.is_dir() && mode & 0o001 == 0 {
+                let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(mode | 0o001));
+            }
+        }
+        cur = d.parent();
+    }
+}
+
+/// No-op where the uid drop isn't applicable (macOS dev).
+#[cfg(not(target_os = "linux"))]
+pub fn ensure_traversable(_dir: &std::path::Path) {}
 
 /// Recursively `lchown` `path` to `(uid, gid)` (symlinks not followed). Used by
 /// the privileged launcher to hand a VM's data dir + disks + sockets to the uid

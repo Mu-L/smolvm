@@ -103,6 +103,28 @@ impl ServeStartCmd {
         // before the tokio runtime, so set_var is safe.
         smolvm::process::apply_system_data_root(/* allow_auto */ true);
 
+        // Lock the state dirs holding machine records / credentials / config down
+        // to 0700 so a Landlock-exempt fork clone (which runs as its golden's uid)
+        // can't read other tenants' data through the now world-traversable data
+        // root. These sit OUTSIDE the traversable VM-data/rootfs chains, so this
+        // doesn't affect VM boots.
+        #[cfg(target_os = "linux")]
+        if smolvm::process::vm_uid_drop_active() {
+            use std::os::unix::fs::PermissionsExt;
+            let mut sensitive: Vec<std::path::PathBuf> = Vec::new();
+            if let Some(d) = dirs::data_local_dir().or_else(dirs::data_dir) {
+                sensitive.push(d.join("smolvm").join("server"));
+                sensitive.push(d.join("smolvm").join("node-credentials"));
+            }
+            if let Some(h) = dirs::home_dir() {
+                sensitive.push(h.join(".config").join("smolvm"));
+            }
+            for dir in sensitive {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
         let listen_target = ListenTarget::parse(&self.listen)?;
 
         // Set up verbose logging if requested

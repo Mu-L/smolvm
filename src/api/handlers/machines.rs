@@ -1348,6 +1348,11 @@ pub async fn delete_machine(
     // Remove VM data directory (disk images, sockets, etc.)
     let data_dir = vm_data_dir(&name);
     if data_dir.exists() {
+        // Release this VM's per-VM uid (if any) back to the allocator before the
+        // dir holding its `.vm-uid` record is removed, so a high-churn cloud node
+        // doesn't leak the uid range. A fork clone has no uid of its own (it
+        // shares its golden's). See process::free_vm_uid.
+        crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), &data_dir);
         if let Err(e) = std::fs::remove_dir_all(&data_dir) {
             tracing::warn!(error = %e, "failed to remove VM data directory: {}", data_dir.display());
         }

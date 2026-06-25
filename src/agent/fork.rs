@@ -156,11 +156,15 @@ pub fn prepare_fork(
         .map_err(|e| Error::agent("create snapshot dir", e.to_string()))?;
     // Under per-VM uid isolation (privileged launcher) the frozen golden VMM runs
     // as its own unprivileged uid and writes the snapshot here via the FORK
-    // command below, so hand this dir to that uid. No-op unless privileged.
-    if let Some((uid, gid)) =
+    // command below, so hand this dir to that uid. No-op unless privileged; if the
+    // drop is active the golden's uid lookup must succeed (fail closed).
+    if let Some(result) =
         crate::process::vm_drop_ids(&crate::agent::vm_uid_registry_dir(), &gdir, None)
     {
-        let _ = crate::process::chown_tree(&snapshot_dir, uid, gid);
+        let (uid, gid) =
+            result.map_err(|e| Error::agent("fork: resolve golden uid", e.to_string()))?;
+        crate::process::chown_tree(&snapshot_dir, uid, gid)
+            .map_err(|e| Error::agent("fork: chown snapshot dir", e.to_string()))?;
     }
 
     // Register the clone in the DB with the golden's config, no running-state,
