@@ -672,6 +672,18 @@ pub fn apply_system_data_root(allow_auto: bool) {
             tracing::warn!(root = %root.display(), error = %e, "failed to create smolvm data root")
         }
     }
+    // Registry auth (crane/docker) falls back to `$HOME/.docker`, which we're about
+    // to move off the operator's real home — pin DOCKER_CONFIG to the ORIGINAL
+    // `~/.docker` (if it exists and the operator hasn't set DOCKER_CONFIG) so
+    // private image pulls keep finding their credentials after the relocation.
+    if std::env::var_os("DOCKER_CONFIG").is_none() {
+        if let Some(dir) = dirs::home_dir()
+            .map(|h| h.join(".docker"))
+            .filter(|d| d.is_dir())
+        {
+            std::env::set_var("DOCKER_CONFIG", dir);
+        }
+    }
     std::env::set_var("HOME", &root);
     std::env::remove_var("XDG_CACHE_HOME");
     std::env::remove_var("XDG_DATA_HOME");
@@ -759,12 +771,30 @@ pub fn allocate_vm_uid(
         let _ = std::fs::write(&cache, uid.to_string());
         return Ok(uid);
     }
-    // Claim the lowest free uid atomically.
+    // Claim the lowest free uid atomically. A uid whose marker points at a VM
+    // whose data dir is gone is STALE — a delete path that didn't free it, or a
+    // crash — so reclaim it. This makes the registry self-healing across every
+    // delete path (no leak even if some path forgets to call `free_vm_uid`). The
+    // VM data dirs are the registry's sibling (`<…>/smolvm/uids` ⇄ `…/vms`); a
+    // marker only exists after its VM's data dir was created, so "marker present
+    // but data dir absent" reliably means deleted, never mid-boot.
+    let vms_dir = registry_dir.parent().map(|p| p.join("vms"));
     for uid in VM_UID_BASE..VM_UID_BASE.saturating_add(VM_UID_SPAN) {
+        let marker = registry_dir.join(uid.to_string());
+        if let Some(key) = uid_marker_key(registry_dir, uid) {
+            let live = vms_dir
+                .as_ref()
+                .map(|v| v.join(&key).exists())
+                .unwrap_or(true);
+            if live {
+                continue; // held by a live VM
+            }
+            let _ = std::fs::remove_file(&marker); // stale → reclaim below
+        }
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(registry_dir.join(uid.to_string()))
+            .open(&marker)
         {
             Ok(mut f) => {
                 use std::io::Write;
@@ -772,7 +802,7 @@ pub fn allocate_vm_uid(
                 let _ = std::fs::write(&cache, uid.to_string());
                 return Ok(uid);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue, // raced
             Err(e) => return Err(e),
         }
     }
@@ -2119,21 +2149,27 @@ mod tests {
         );
     }
 
+    /// `(base, registry, vms)` laid out as production: `<base>/smolvm/{uids,vms}`,
+    /// so the allocator's `registry.parent()/vms` resolves to `vms`. A VM's data
+    /// dir is `vms/<vm_key>`.
     #[cfg(target_os = "linux")]
-    fn tmp_registry(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("smolvm-uidtest-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(d.join("reg")).unwrap();
-        d
+    fn tmp_uid_dirs(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("smolvm-uidtest-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let reg = base.join("smolvm").join("uids");
+        let vms = base.join("smolvm").join("vms");
+        std::fs::create_dir_all(&reg).unwrap();
+        std::fs::create_dir_all(&vms).unwrap();
+        (base, reg, vms)
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn allocate_vm_uid_is_stable_collision_free_and_freeable() {
-        let base = tmp_registry("alloc");
-        let reg = base.join("reg");
-        let a = base.join("vm-a");
-        let b = base.join("vm-b");
+        let (base, reg, vms) = tmp_uid_dirs("alloc");
+        let a = vms.join("aaaa");
+        let b = vms.join("bbbb");
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
 
@@ -2150,7 +2186,7 @@ mod tests {
 
         // Free A, then a new VM reuses A's released uid (lowest-free).
         free_vm_uid(&reg, &a);
-        let c = base.join("vm-c");
+        let c = vms.join("cccc");
         std::fs::create_dir_all(&c).unwrap();
         assert_eq!(
             allocate_vm_uid(&reg, &c, "cccc").unwrap(),
@@ -2164,14 +2200,39 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn registered_uid_recovers_assignment_when_cache_lost() {
-        let base = tmp_registry("recover");
-        let reg = base.join("reg");
-        let a = base.join("vm-a");
+        let (base, reg, vms) = tmp_uid_dirs("recover");
+        let a = vms.join("key-a");
         std::fs::create_dir_all(&a).unwrap();
         let ua = allocate_vm_uid(&reg, &a, "key-a").unwrap();
         // Drop the per-VM cache; the registry still maps key -> uid.
         let _ = std::fs::remove_file(a.join(".vm-uid"));
         assert_eq!(allocate_vm_uid(&reg, &a, "key-a").unwrap(), ua);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allocator_self_heals_leaked_uid_when_vm_dir_gone() {
+        let (base, reg, vms) = tmp_uid_dirs("selfheal");
+        let a = vms.join("aaaa");
+        std::fs::create_dir_all(&a).unwrap();
+        let ua = allocate_vm_uid(&reg, &a, "aaaa").unwrap();
+
+        // Simulate a delete path that removed the VM's data dir WITHOUT calling
+        // free_vm_uid: the registry marker is now leaked.
+        std::fs::remove_dir_all(&a).unwrap();
+        assert!(reg.join(ua.to_string()).exists(), "marker is leaked");
+
+        // A new VM reclaims that stale uid (its VM dir is gone) — no permanent
+        // leak even though the delete path forgot to free it.
+        let b = vms.join("bbbb");
+        std::fs::create_dir_all(&b).unwrap();
+        assert_eq!(
+            allocate_vm_uid(&reg, &b, "bbbb").unwrap(),
+            ua,
+            "stale (data-dir-gone) uid must be reclaimed"
+        );
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
