@@ -117,6 +117,7 @@ impl LibkrunVm {
             let krun_add_virtiofs = krun.add_virtiofs;
             let krun_set_port_map = krun.set_port_map;
             let krun_add_disk2 = krun.add_disk2;
+            let krun_add_vsock = krun.add_vsock;
             let krun_add_vsock_port2 = krun.add_vsock_port2;
             let krun_start_enter = krun.start_enter;
 
@@ -147,6 +148,14 @@ impl LibkrunVm {
             if ret < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::vm_creation("failed to set root filesystem"));
+            }
+
+            // Upstream libkrun no longer creates an implicit vsock; both
+            // krun_set_port_map and krun_add_vsock_port2 require a vsock device
+            // (else -ENODEV). Add it explicitly (no TSI hijacking) before they run.
+            if krun_add_vsock(ctx, 0) < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::vm_creation("failed to add vsock device"));
             }
 
             // Set empty port map (required by libkrun)

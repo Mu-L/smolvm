@@ -591,6 +591,16 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         "libkrun does not expose krun_add_net_unixstream; update libkrun or use --net-backend tsi",
                     )
                 })?;
+                // virtio-net carries guest networking, but the host-guest control
+                // channel still rides vsock. Upstream libkrun no longer creates an
+                // implicit vsock, so add it explicitly (no TSI hijacking — virtio-net
+                // owns the network path); otherwise krun_add_vsock_port2 below fails
+                // with ENODEV.
+                if krun_add_vsock(ctx, 0) < 0 {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent("configure vsock", "krun_add_vsock failed"));
+                }
+
                 let mut guest_network = GuestNetworkConfig::default();
                 // A custom resolver (--dns) becomes the gateway's upstream: the
                 // guest still points at the gateway (100.96.0.1), which forwards

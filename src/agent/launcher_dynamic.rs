@@ -252,6 +252,16 @@ pub fn launch_agent_vm_dynamic(
                 "libkrun does not expose krun_add_net_unixstream; update libkrun or use --net-backend tsi"
                     .to_string()
             })?;
+
+            // virtio-net carries guest networking, but the host-guest control
+            // channel still rides vsock. Upstream libkrun no longer creates an
+            // implicit vsock, so add it explicitly (no TSI hijacking — virtio-net
+            // owns the network path); otherwise krun_add_vsock_port2 below fails
+            // with ENODEV.
+            if unsafe { (krun.add_vsock)(ctx, 0) } < 0 {
+                free_ctx_on_err!("krun_add_vsock failed");
+            }
+
             let guest_network = GuestNetworkConfig::default();
             let mut guest_mac = guest_network.guest_mac;
             let (host_fd, guest_fd) =
