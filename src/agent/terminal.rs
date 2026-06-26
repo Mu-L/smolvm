@@ -262,60 +262,339 @@ pub use unix_impl::{
     stdin_is_tty, write_all_retry, NonBlockingStdin, PollResult, RawModeGuard,
 };
 
-/// Windows compile-only stubs for the interactive-terminal API.
+/// Windows implementation of the interactive-terminal API.
 ///
-/// These keep the agent client compiling on Windows; interactive exec sessions
-/// are not driven through the Windows host build, so the stubs return inert
-/// values rather than implementing console raw-mode / poll multiplexing.
+/// Mirrors the POSIX `unix_impl` module using Win32 console + WinSock APIs so
+/// `machine exec -it` / `machine shell` drive a real raw-mode session on
+/// Windows. The shared poll loop in `agent::client` is platform-agnostic and
+/// is reused unchanged; only these primitives differ.
 #[cfg(not(unix))]
 #[allow(missing_docs)]
-mod windows_stub {
+mod windows_impl {
     use super::Fd;
     use std::io;
+    use std::sync::Mutex;
 
-    pub fn install_sigwinch_handler() {}
+    use windows_sys::Win32::Foundation::{HANDLE, WAIT_FAILED};
+    use windows_sys::Win32::Networking::WinSock::{
+        ioctlsocket, WSACloseEvent, WSACreateEvent, WSAEnumNetworkEvents, WSAEventSelect,
+        FD_CLOSE, FD_READ, FIONBIO, SOCKET, WSAEVENT, WSANETWORKEVENTS, WSA_INVALID_EVENT,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetConsoleScreenBufferInfo, GetNumberOfConsoleInputEvents, GetStdHandle,
+        PeekConsoleInputW, ReadConsoleInputW, SetConsoleMode, CONSOLE_SCREEN_BUFFER_INFO,
+        DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+        ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        INPUT_RECORD, KEY_EVENT, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
 
-    pub fn check_sigwinch() -> bool {
-        false
+    /// Convert the portable `Fd` (an `i64` carrying a console `HANDLE`) into a
+    /// Win32 `HANDLE`.
+    fn fd_to_handle(fd: Fd) -> HANDLE {
+        fd as usize as HANDLE
     }
 
-    pub struct RawModeGuard;
+    /// Convert the portable `Fd` (an `i64` carrying a WinSock `SOCKET`) into a
+    /// `SOCKET`.
+    fn fd_to_socket(fd: Fd) -> SOCKET {
+        fd as usize as SOCKET
+    }
 
-    impl RawModeGuard {
-        pub fn new(_fd: Fd) -> Option<Self> {
-            None
+    fn std_output_handle() -> HANDLE {
+        // SAFETY: GetStdHandle has no preconditions.
+        unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }
+    }
+
+    /// Last terminal size observed, used to emulate SIGWINCH via polling.
+    static LAST_SIZE: Mutex<Option<(u16, u16)>> = Mutex::new(None);
+
+    /// Seed the resize cache with the current terminal size.
+    ///
+    /// The Windows console has no SIGWINCH; resize is detected by comparing the
+    /// current size against this cache in [`check_sigwinch`].
+    pub fn install_sigwinch_handler() {
+        let current = get_terminal_size();
+        if let Ok(mut guard) = LAST_SIZE.lock() {
+            *guard = current;
         }
     }
 
-    pub fn get_terminal_size() -> Option<(u16, u16)> {
-        None
+    /// Return `true` if the terminal has been resized since the last check.
+    pub fn check_sigwinch() -> bool {
+        let current = get_terminal_size();
+        let mut guard = match LAST_SIZE.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        if *guard != current {
+            *guard = current;
+            true
+        } else {
+            false
+        }
     }
 
+    /// RAII guard for console raw mode.
+    ///
+    /// Saves the input handle's mode (and the output handle's VT mode), switches
+    /// the console into raw VT-input mode, and restores both on drop.
+    pub struct RawModeGuard {
+        input: HANDLE,
+        original_input_mode: u32,
+        output: HANDLE,
+        original_output_mode: u32,
+        restore_output: bool,
+    }
+
+    impl RawModeGuard {
+        /// Enable raw mode on the given console input handle.
+        ///
+        /// Returns `None` if the handle is not a console.
+        pub fn new(fd: Fd) -> Option<Self> {
+            let input = fd_to_handle(fd);
+
+            let mut original_input_mode: u32 = 0;
+            // SAFETY: `input` is the process's console input handle; GetConsoleMode
+            // fails (returns 0) if it is not a console, which we treat as "no TTY".
+            if unsafe { GetConsoleMode(input, &mut original_input_mode) } == 0 {
+                return None;
+            }
+
+            // Clear cooked-mode input flags, enable VT input so the guest sees
+            // raw key/escape sequences.
+            let raw_input_mode = (original_input_mode
+                & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+                | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            // SAFETY: setting a derived mode on a valid console handle.
+            if unsafe { SetConsoleMode(input, raw_input_mode) } == 0 {
+                return None;
+            }
+
+            // Enable VT processing on output so ANSI escapes from the guest render.
+            let output = std_output_handle();
+            let mut original_output_mode: u32 = 0;
+            let restore_output =
+                // SAFETY: querying the output handle's mode.
+                if unsafe { GetConsoleMode(output, &mut original_output_mode) } != 0 {
+                    let out_mode = original_output_mode
+                        | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                        | DISABLE_NEWLINE_AUTO_RETURN;
+                    // SAFETY: setting a derived mode on a valid console output handle.
+                    unsafe {
+                        SetConsoleMode(output, out_mode);
+                    }
+                    true
+                } else {
+                    false
+                };
+
+            Some(Self {
+                input,
+                original_input_mode,
+                output,
+                original_output_mode,
+                restore_output,
+            })
+        }
+    }
+
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            // SAFETY: restoring previously-saved console modes on valid handles.
+            unsafe {
+                SetConsoleMode(self.input, self.original_input_mode);
+                if self.restore_output {
+                    SetConsoleMode(self.output, self.original_output_mode);
+                }
+            }
+        }
+    }
+
+    /// Get the current terminal size from the console window rectangle.
+    pub fn get_terminal_size() -> Option<(u16, u16)> {
+        let output = std_output_handle();
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: `output` is the console output handle; the call fails (0) if it
+        // is not a console.
+        if unsafe { GetConsoleScreenBufferInfo(output, &mut info) } == 0 {
+            return None;
+        }
+        let w = info.srWindow;
+        let cols = (w.Right - w.Left + 1).max(0) as u16;
+        let rows = (w.Bottom - w.Top + 1).max(0) as u16;
+        Some((cols, rows))
+    }
+
+    /// Poll result indicating which sources have data available.
     pub struct PollResult {
         pub stdin_ready: bool,
         pub socket_ready: bool,
         pub socket_hangup: bool,
     }
 
-    pub fn poll_io(_stdin_fd: Fd, _socket_fd: Fd, _timeout_ms: i32) -> io::Result<PollResult> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "interactive terminal sessions are not supported on Windows",
-        ))
+    /// Poll the console input handle and the agent socket for readability.
+    ///
+    /// `timeout_ms` is in milliseconds; -1 means infinite. A `stdin_fd` of -1
+    /// (the loop's EOF sentinel) suppresses waiting on console input.
+    pub fn poll_io(stdin_fd: Fd, socket_fd: Fd, timeout_ms: i32) -> io::Result<PollResult> {
+        let socket = fd_to_socket(socket_fd);
+
+        // Register the socket with a WSA event for FD_READ | FD_CLOSE. This also
+        // puts the socket into non-blocking mode; we restore blocking before
+        // returning so the client's blocking receive() behaves like Unix.
+        // SAFETY: WSACreateEvent has no preconditions.
+        let event: WSAEVENT = unsafe { WSACreateEvent() };
+        if event == WSA_INVALID_EVENT {
+            return Err(io::Error::last_os_error());
+        }
+
+        // Restore the socket to blocking and free the event on every exit path.
+        struct SocketCleanup {
+            socket: SOCKET,
+            event: WSAEVENT,
+        }
+        impl Drop for SocketCleanup {
+            fn drop(&mut self) {
+                // SAFETY: deregister the event selection, then put the socket back
+                // into blocking mode and close the event.
+                unsafe {
+                    WSAEventSelect(self.socket, 0 as WSAEVENT, 0);
+                    let mut nonblocking: u32 = 0;
+                    ioctlsocket(self.socket, FIONBIO, &mut nonblocking);
+                    WSACloseEvent(self.event);
+                }
+            }
+        }
+        let _cleanup = SocketCleanup { socket, event };
+
+        // SAFETY: registering FD_READ|FD_CLOSE notifications on the socket.
+        if unsafe {
+            WSAEventSelect(socket, event, (FD_READ | FD_CLOSE) as i32)
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        let wait_console = stdin_fd != -1;
+        let console = fd_to_handle(stdin_fd);
+
+        // Build the wait handle set: optionally the console input handle, then
+        // the WSA event (which is HANDLE-compatible).
+        let mut handles: [HANDLE; 2] = [0 as HANDLE; 2];
+        let mut count: u32 = 0;
+        if wait_console {
+            handles[count as usize] = console;
+            count += 1;
+        }
+        handles[count as usize] = event as usize as HANDLE;
+        count += 1;
+
+        let dw_timeout: u32 = if timeout_ms < 0 {
+            u32::MAX // INFINITE
+        } else {
+            timeout_ms as u32
+        };
+
+        // SAFETY: `handles[..count]` are valid waitable handles.
+        let wait = unsafe { WaitForMultipleObjects(count, handles.as_ptr(), 0, dw_timeout) };
+
+        if wait == WAIT_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut stdin_ready = false;
+        let mut socket_ready = false;
+        let mut socket_hangup = false;
+
+        // The console input handle signals for non-key events too (focus, mouse,
+        // resize). Peek and only report stdin readiness for actual key/char input;
+        // drain non-key records so we don't busy-loop.
+        if wait_console {
+            stdin_ready = console_input_has_key(console);
+        }
+
+        // Read which socket events fired regardless of which handle woke the wait —
+        // WSAEnumNetworkEvents reflects all pending notifications and resets them.
+        let mut net_events: WSANETWORKEVENTS = unsafe { std::mem::zeroed() };
+        // SAFETY: `socket` and `event` are valid; net_events is writable.
+        if unsafe { WSAEnumNetworkEvents(socket, event, &mut net_events) } == 0 {
+            if net_events.lNetworkEvents & FD_READ as i32 != 0 {
+                socket_ready = true;
+            }
+            if net_events.lNetworkEvents & FD_CLOSE as i32 != 0 {
+                socket_hangup = true;
+            }
+        }
+
+        Ok(PollResult {
+            stdin_ready,
+            socket_ready,
+            socket_hangup,
+        })
     }
 
+    /// Inspect pending console input records: return `true` if a key/char event
+    /// is queued. Non-key events (focus/mouse/buffer-resize) are drained so the
+    /// wait doesn't busy-loop, but key events are left in the queue so the
+    /// client's subsequent `Stdin::read` (ReadFile/ReadConsole) consumes them.
+    fn console_input_has_key(console: HANDLE) -> bool {
+        loop {
+            let mut available: u32 = 0;
+            // SAFETY: querying the count of pending input records.
+            if unsafe { GetNumberOfConsoleInputEvents(console, &mut available) } == 0
+                || available == 0
+            {
+                return false;
+            }
+
+            // Peek (non-destructive) at the next record.
+            let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+            let mut read: u32 = 0;
+            // SAFETY: peeks one record into `record` without removing it.
+            if unsafe { PeekConsoleInputW(console, &mut record, 1, &mut read) } == 0 || read == 0 {
+                return false;
+            }
+
+            if record.EventType as u32 == KEY_EVENT {
+                // Real input — leave it queued for the loop's stdin read.
+                return true;
+            }
+
+            // Non-key event: remove just this record so the wait doesn't keep
+            // re-signaling on it, then look again for a real key event.
+            // SAFETY: removes exactly one (the peeked non-key) record.
+            if unsafe { ReadConsoleInputW(console, &mut record, 1, &mut read) } == 0 || read == 0 {
+                return false;
+            }
+        }
+    }
+
+    /// Check if stdin is a console (TTY).
     pub fn stdin_is_tty() -> bool {
-        false
+        // SAFETY: GetStdHandle + GetConsoleMode; the latter fails for non-consoles.
+        unsafe {
+            let h = GetStdHandle(STD_INPUT_HANDLE);
+            let mut mode: u32 = 0;
+            GetConsoleMode(h, &mut mode) != 0
+        }
     }
 
+    /// Write all bytes to a writer.
     pub fn write_all_retry(writer: &mut impl io::Write, data: &[u8]) -> io::Result<()> {
         writer.write_all(data)
     }
 
+    /// Flush a writer.
     pub fn flush_retry(writer: &mut impl io::Write) -> io::Result<()> {
         writer.flush()
     }
 
+    /// RAII guard placeholder for non-blocking stdin.
+    ///
+    /// On Windows the interactive loop only reads stdin after `poll_io` reports
+    /// readiness, and reads through `std::io::Stdin::read` (which yields UTF-8
+    /// from the VT-input console), so no fd-level non-blocking flag is needed.
     pub struct NonBlockingStdin;
 
     impl NonBlockingStdin {
@@ -326,7 +605,7 @@ mod windows_stub {
 }
 
 #[cfg(not(unix))]
-pub use windows_stub::{
+pub use windows_impl::{
     check_sigwinch, flush_retry, get_terminal_size, install_sigwinch_handler, poll_io,
     stdin_is_tty, write_all_retry, NonBlockingStdin, PollResult, RawModeGuard,
 };

@@ -81,6 +81,16 @@ impl UdsStream {
     pub fn as_socket(&self) -> &Socket {
         &self.inner
     }
+
+    /// Raw Windows `SOCKET` handle for the interactive-terminal poll loop.
+    ///
+    /// Returned as a `u64` (the width of a `SOCKET`) so callers can hand it to
+    /// the WinSock APIs the poll loop uses.
+    #[cfg(windows)]
+    pub fn raw_socket(&self) -> u64 {
+        use std::os::windows::io::AsRawSocket;
+        self.inner.as_raw_socket()
+    }
 }
 
 #[cfg(unix)]

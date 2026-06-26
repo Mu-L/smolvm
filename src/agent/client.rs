@@ -343,8 +343,8 @@ impl<F: FnMut(usize, usize, &str)> PullOptions<F> {
 }
 
 /// Raw descriptor of the process's stdin, in the portable form the terminal
-/// poll loop expects. Unix: the real fd; Windows: a placeholder (the poll loop
-/// is a stub there).
+/// poll loop expects. Unix: the real fd; Windows: the `STD_INPUT_HANDLE`
+/// console handle cast into the portable `Fd`.
 fn stdin_raw_fd() -> crate::agent::terminal::Fd {
     #[cfg(unix)]
     {
@@ -353,7 +353,15 @@ fn stdin_raw_fd() -> crate::agent::terminal::Fd {
     }
     #[cfg(not(unix))]
     {
-        0
+        // SAFETY: GetStdHandle has no preconditions; it returns the process's
+        // standard-input HANDLE (or INVALID_HANDLE_VALUE), which the Windows
+        // poll loop interprets.
+        let handle = unsafe {
+            windows_sys::Win32::System::Console::GetStdHandle(
+                windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
+            )
+        };
+        handle as crate::agent::terminal::Fd
     }
 }
 
@@ -976,8 +984,8 @@ impl AgentClient {
     }
 
     /// Raw descriptor of the underlying agent socket, in the portable form the
-    /// terminal poll loop expects. Unix: the socket fd; Windows: a placeholder
-    /// (the poll loop is a stub there).
+    /// terminal poll loop expects. Unix: the socket fd; Windows: the underlying
+    /// WinSock `SOCKET` cast into the portable `Fd`.
     fn stream_raw_fd(&self) -> crate::agent::terminal::Fd {
         #[cfg(unix)]
         {
@@ -986,7 +994,7 @@ impl AgentClient {
         }
         #[cfg(not(unix))]
         {
-            0
+            self.stream.raw_socket() as crate::agent::terminal::Fd
         }
     }
 
