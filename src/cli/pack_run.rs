@@ -455,7 +455,7 @@ impl PackRunCmd {
 /// RAII guard that terminates the VM child process and cleans up the
 /// per-invocation runtime directory on drop.
 struct ChildGuard {
-    pid: libc::pid_t,
+    pid: smolvm::process::Pid,
     start_time: Option<u64>,
     runtime_dir: tempfile::TempDir,
 }
@@ -1391,12 +1391,12 @@ fn daemon_dir(checksum: u32) -> smolvm::Result<PathBuf> {
 ///
 /// The PID file format is: `{pid}\n{start_time}`.
 /// Returns `None` if the file doesn't exist or is malformed.
-fn read_daemon_pid(checksum: u32) -> Option<(libc::pid_t, Option<u64>)> {
+fn read_daemon_pid(checksum: u32) -> Option<(smolvm::process::Pid, Option<u64>)> {
     let dir = daemon_dir(checksum).ok()?;
     let pid_path = dir.join("agent.pid");
     let contents = std::fs::read_to_string(&pid_path).ok()?;
     let mut lines = contents.lines();
-    let pid: libc::pid_t = lines.next()?.parse().ok()?;
+    let pid: smolvm::process::Pid = lines.next()?.parse().ok()?;
     let start_time: Option<u64> = lines.next().and_then(|s| s.parse().ok());
     Some((pid, start_time))
 }
@@ -1404,7 +1404,7 @@ fn read_daemon_pid(checksum: u32) -> Option<(libc::pid_t, Option<u64>)> {
 /// Write PID and start time to the daemon PID file.
 fn write_daemon_pid(
     checksum: u32,
-    pid: libc::pid_t,
+    pid: smolvm::process::Pid,
     start_time: Option<u64>,
 ) -> smolvm::Result<()> {
     let dir = daemon_dir(checksum)?;

@@ -66,6 +66,16 @@ impl HostMount {
         ("/run", true),
     ];
 
+    /// Protected host paths that must never be mounted into the guest (Windows).
+    #[cfg(target_os = "windows")]
+    const ILLEGAL_SOURCE_MOUNT_PATH: &[(&str, bool)] = &[
+        ("C:\\", false),
+        ("C:\\Windows", true),
+        ("C:\\Program Files", true),
+        ("C:\\Program Files (x86)", true),
+        ("C:\\ProgramData", true),
+    ];
+
     /// Create a host mount with an explicit read-only flag.
     pub fn new(
         source: impl Into<PathBuf>,

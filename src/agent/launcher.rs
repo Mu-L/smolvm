@@ -8,18 +8,31 @@ use crate::data::consts::{ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR};
 use crate::data::disk::DiskFormat;
 use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
-use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
+use crate::network::backend::TSI_FEATURE_HIJACK_INET;
+// Only used by the unix-only virtio-net path.
+#[cfg(unix)]
+use crate::network::backend::COMPAT_NET_FEATURES;
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
 use crate::storage::{OverlayDisk, StorageDisk};
 use crate::util::{libkrun_filename, libkrunfw_filename};
 
-use smolvm_network::{
-    start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
-    VirtioNetworkRuntime,
-};
+use smolvm_network::{GuestNetworkConfig, VirtioNetworkRuntime};
+// `VirtioPortMapping` is only used by the unix-only virtio-net path.
+#[cfg(unix)]
+use smolvm_network::PortMapping as VirtioPortMapping;
+// `start_virtio_network` is `#[cfg(unix)]` in smolvm-network; virtio-net
+// networking is unix-only, so the import is gated to match.
+#[cfg(unix)]
+use smolvm_network::start_virtio_network;
 use smolvm_protocol::{guest_env, ports};
 use std::ffi::CString;
+// `std::os::fd` does not exist on Windows. Keep the `RawFd` name working in
+// signatures on both platforms via a portable alias.
+#[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(not(unix))]
+#[allow(dead_code)]
+type RawFd = std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 
 use super::{KrunFunctions, PortMapping, VmResources};
@@ -319,6 +332,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         };
     }
 
+    // `egress_telemetry` is consumed only by the unix-only virtio-net path.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let LaunchConfig {
         rootfs_path,
         disks,
@@ -513,8 +528,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
         let network_plan = select_network_plan(resources, *dns_filter_enabled, port_mappings.len());
 
+        // `mut` is only needed on unix (the VirtioNet arm assigns it); on
+        // Windows that arm diverges, so the binding is never reassigned.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
-        let guest_network = match network_plan.backend {
+        // Explicit type: on Windows the VirtioNet arm diverges (`!`), so the
+        // element type can no longer be inferred from the arms alone.
+        let guest_network: Option<GuestNetworkConfig> = match network_plan.backend {
             EffectiveNetworkBackend::None => {
                 // Upstream libkrun no longer creates an implicit vsock (the old
                 // krun_disable_implicit_vsock is gone), so just add it explicitly.
@@ -614,6 +634,18 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 None
             }
             EffectiveNetworkBackend::VirtioNet => {
+                // virtio-net networking relies on unix socketpair fds and the
+                // unix-only `start_virtio_network`; it is unsupported on Windows.
+                #[cfg(not(unix))]
+                {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "configure virtio-net",
+                        "virtio-net networking is not supported on Windows",
+                    ));
+                }
+                #[cfg(unix)]
+                {
                 let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
                     Error::agent(
                         "configure virtio-net",
@@ -696,6 +728,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
                 tracing::info!("network backend: virtio-net");
                 Some(guest_network)
+                }
             }
         };
 
@@ -970,6 +1003,17 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             cstr("TERM=xterm-256color"),
         ];
 
+        // Host wall-clock at launch, so the agent can seed the guest clock on
+        // hypervisors without a guest-readable paravirt clock (WHP/Windows). The
+        // agent ignores it unless its own clock looks obviously wrong.
+        if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            env_strings.push(cstr(&format!(
+                "{}={}",
+                guest_env::HOST_TIME_NS,
+                now.as_nanos()
+            )));
+        }
+
         // Pass mount info to the agent via environment
         // Format: SMOLVM_MOUNT_0=tag:guest_path:ro
         for (i, mount) in mounts.iter().enumerate() {
@@ -1165,6 +1209,8 @@ fn rootfs_dax_disabled() -> bool {
         .unwrap_or(false)
 }
 
+// Unix-only: virtio-net is the sole caller and is itself unix-gated.
+#[cfg(unix)]
 fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
     let mut fds = [0; 2];
     // SAFETY: `socketpair` initializes both descriptors on success.
@@ -1243,6 +1289,9 @@ fn resolve_host_subprocess(host: &str) -> std::result::Result<Vec<String>, Strin
 
 /// Raise file descriptor limits (required by libkrun).
 fn raise_fd_limits() {
+    // rlimit is a unix concept; no-op on Windows. The function stays callable
+    // on all platforms so its (unconditional) call sites need no gating.
+    #[cfg(unix)]
     unsafe {
         let mut limit = libc::rlimit {
             rlim_cur: 0,

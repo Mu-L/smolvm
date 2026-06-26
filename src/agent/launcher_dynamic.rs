@@ -6,15 +6,28 @@
 //!
 //! The static FFI path in `launcher.rs` remains untouched for normal operations.
 
-use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
+use crate::network::backend::TSI_FEATURE_HIJACK_INET;
+// Only used by the unix-only virtio-net path.
+#[cfg(unix)]
+use crate::network::backend::COMPAT_NET_FEATURES;
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
-use smolvm_network::{
-    start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
-    VirtioNetworkRuntime,
-};
+use smolvm_network::{GuestNetworkConfig, VirtioNetworkRuntime};
+// `VirtioPortMapping` is only used by the unix-only virtio-net path.
+#[cfg(unix)]
+use smolvm_network::PortMapping as VirtioPortMapping;
+// `start_virtio_network` is `#[cfg(unix)]` in smolvm-network; virtio-net
+// networking is unix-only, so the import is gated to match.
+#[cfg(unix)]
+use smolvm_network::start_virtio_network;
 use smolvm_protocol::{guest_env, ports};
 use std::ffi::CString;
+// `std::os::fd` does not exist on Windows. Keep the `RawFd` name working in
+// signatures on both platforms via a portable alias.
+#[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(not(unix))]
+#[allow(dead_code)]
+type RawFd = std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 
 pub use super::krun::KrunFunctions;
@@ -80,7 +93,9 @@ pub fn launch_agent_vm_dynamic(
     // Raise file descriptor limits
     raise_fd_limits();
 
-    // Set library path so libkrun can find libkrunfw
+    // Set library path so libkrun can find libkrunfw. Only consumed by the
+    // macos/linux env-var blocks below, so unused on other targets (Windows).
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(unused_variables))]
     let lib_dir = config
         .rootfs_path
         .parent()
@@ -189,8 +204,13 @@ pub fn launch_agent_vm_dynamic(
 
     let network_plan = plan_launch_network(&config.resources, None, config.port_mappings.len());
 
+    // `mut` is only needed on unix (the VirtioNet arm assigns it); on Windows
+    // that arm diverges, so the binding is never reassigned.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
-    let guest_network = match network_plan.backend {
+    // Explicit type: on Windows the VirtioNet arm diverges (`!`), so the
+    // element type can no longer be inferred from the arms alone.
+    let guest_network: Option<GuestNetworkConfig> = match network_plan.backend {
         EffectiveNetworkBackend::None => {
             // Upstream libkrun no longer creates an implicit vsock; add explicitly.
             if unsafe { (krun.add_vsock)(ctx, 0) } < 0 {
@@ -255,6 +275,14 @@ pub fn launch_agent_vm_dynamic(
             None
         }
         EffectiveNetworkBackend::VirtioNet => {
+            // virtio-net networking relies on unix socketpair fds and the
+            // unix-only `start_virtio_network`; it is unsupported on Windows.
+            #[cfg(not(unix))]
+            {
+                free_ctx_on_err!("virtio-net networking is not supported on Windows");
+            }
+            #[cfg(unix)]
+            {
             let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
                 "libkrun does not expose krun_add_net_unixstream; update libkrun or use --net-backend tsi"
                     .to_string()
@@ -312,6 +340,7 @@ pub fn launch_agent_vm_dynamic(
 
             tracing::info!("network backend: virtio-net");
             Some(guest_network)
+            }
         }
     };
 
@@ -482,6 +511,8 @@ fn path_to_cstring(path: &Path) -> Result<CString, String> {
         .map_err(|_| "path contains null byte".to_string())
 }
 
+// Unix-only: virtio-net is the sole caller and is itself unix-gated.
+#[cfg(unix)]
 fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
     let mut fds = [0; 2];
     // SAFETY: `socketpair` initializes both descriptors on success.
@@ -494,6 +525,9 @@ fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
 
 /// Raise file descriptor limits (required by libkrun).
 fn raise_fd_limits() {
+    // rlimit is a unix concept; no-op on Windows. The function stays callable
+    // on all platforms so its (unconditional) call sites need no gating.
+    #[cfg(unix)]
     unsafe {
         let mut limit = libc::rlimit {
             rlim_cur: 0,

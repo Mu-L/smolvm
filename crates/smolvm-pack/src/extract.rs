@@ -13,6 +13,20 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
+/// Set a Unix file mode on `path`, ignoring errors. No-op on non-Unix targets
+/// (Windows has no POSIX mode bits).
+#[inline]
+fn set_mode(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+}
+
 /// Files larger than this threshold are extracted with a sparse write
 /// (ftruncate skeleton + pwrite only non-zero 64 KiB chunks) rather than a
 /// dense sequential write.  Chosen to match typical overlay disk sizes while
@@ -238,7 +252,7 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
         // before child entries, which prevents creating files or subdirectories.
         if let Some(parent) = full_path.parent() {
             if parent.is_dir() {
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
+                set_mode(parent, 0o755);
             }
         }
 
@@ -285,8 +299,7 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
             // entries (children) can be created inside it. Final permissions
             // are applied after the loop.
             if entry_type == tar::EntryType::Directory && full_path.is_dir() {
-                let _ =
-                    std::fs::set_permissions(&full_path, std::fs::Permissions::from_mode(0o755));
+                set_mode(&full_path, 0o755);
             }
         }
     }
@@ -294,7 +307,7 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
     // Apply deferred directory permissions now that all children are written.
     for (path, mode) in deferred_dir_modes {
         if path.is_dir() {
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+            set_mode(&path, mode);
         }
     }
 
@@ -549,6 +562,10 @@ pub fn extract_sidecar(
     // Acquire an exclusive lock adjacent to the cache directory.
     // This serializes concurrent first-run extractions of the same checksum.
     let lock_path = cache_dir.with_extension("lock");
+    // Held open for the function's duration. On Unix it backs the `flock`
+    // below; on Windows there is no `flock` here, so the handle is unused but
+    // still kept alive (binding it suppresses the unused warning there).
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let lock_file = fs::OpenOptions::new()
         .create(true)
         .write(true)

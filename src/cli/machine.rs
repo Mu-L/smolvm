@@ -24,7 +24,6 @@ use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::io::Write;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -154,19 +153,23 @@ fn try_spawn_detached_cleanup(
         Ok(p) => p,
         Err(_) => return false,
     };
-    let result = std::process::Command::new(exe)
-        .arg("_cleanup-ephemeral")
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("_cleanup-ephemeral")
         .arg(vm_name)
         .arg(pid.to_string())
         .arg(start_time_val.to_string())
         .arg(ephemeral_name)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        // New process group so the helper is immune to SIGHUP when the
-        // parent terminal closes. pgid = child pid.
-        .process_group(0)
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    // New process group so the helper is immune to SIGHUP when the parent
+    // terminal closes (pgid = child pid). POSIX-only; no Windows equivalent.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let result = cmd.spawn();
     // Drop the Child handle without waiting — we exit immediately after this.
     // The OS will not create a zombie because the helper outlives us and its
     // real parent (launchd/init) reaps it when it exits.

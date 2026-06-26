@@ -2,7 +2,25 @@
 //!
 //! Provides raw mode control and I/O multiplexing for bidirectional
 //! communication between local terminal and remote VM.
+//!
+//! The interactive TTY machinery (raw mode, `poll()`-based I/O multiplexing,
+//! SIGWINCH handling, non-blocking stdin) is POSIX-specific. On Windows the
+//! same public API is provided as compile-only stubs: the host control plane
+//! builds, but interactive exec sessions are not wired up there. See the
+//! `windows_stub` module below.
 
+/// Portable file-descriptor handle used by the interactive poll loop. A real
+/// `RawFd` on Unix; an opaque placeholder on Windows where the poll loop is a
+/// stub.
+#[cfg(unix)]
+pub type Fd = std::os::unix::io::RawFd;
+/// Portable file-descriptor handle (Windows): an opaque placeholder, since the
+/// `poll()`-based interactive loop is a stub there.
+#[cfg(not(unix))]
+pub type Fd = i64;
+
+#[cfg(unix)]
+mod unix_impl {
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -236,7 +254,84 @@ impl Drop for NonBlockingStdin {
     }
 }
 
-#[cfg(test)]
+} // mod unix_impl
+
+#[cfg(unix)]
+pub use unix_impl::{
+    check_sigwinch, flush_retry, get_terminal_size, install_sigwinch_handler, poll_io,
+    stdin_is_tty, write_all_retry, NonBlockingStdin, PollResult, RawModeGuard,
+};
+
+/// Windows compile-only stubs for the interactive-terminal API.
+///
+/// These keep the agent client compiling on Windows; interactive exec sessions
+/// are not driven through the Windows host build, so the stubs return inert
+/// values rather than implementing console raw-mode / poll multiplexing.
+#[cfg(not(unix))]
+#[allow(missing_docs)]
+mod windows_stub {
+    use super::Fd;
+    use std::io;
+
+    pub fn install_sigwinch_handler() {}
+
+    pub fn check_sigwinch() -> bool {
+        false
+    }
+
+    pub struct RawModeGuard;
+
+    impl RawModeGuard {
+        pub fn new(_fd: Fd) -> Option<Self> {
+            None
+        }
+    }
+
+    pub fn get_terminal_size() -> Option<(u16, u16)> {
+        None
+    }
+
+    pub struct PollResult {
+        pub stdin_ready: bool,
+        pub socket_ready: bool,
+        pub socket_hangup: bool,
+    }
+
+    pub fn poll_io(_stdin_fd: Fd, _socket_fd: Fd, _timeout_ms: i32) -> io::Result<PollResult> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "interactive terminal sessions are not supported on Windows",
+        ))
+    }
+
+    pub fn stdin_is_tty() -> bool {
+        false
+    }
+
+    pub fn write_all_retry(writer: &mut impl io::Write, data: &[u8]) -> io::Result<()> {
+        writer.write_all(data)
+    }
+
+    pub fn flush_retry(writer: &mut impl io::Write) -> io::Result<()> {
+        writer.flush()
+    }
+
+    pub struct NonBlockingStdin;
+
+    impl NonBlockingStdin {
+        pub fn new() -> io::Result<Self> {
+            Ok(Self)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub use windows_stub::{
+    check_sigwinch, flush_retry, get_terminal_size, install_sigwinch_handler, poll_io,
+    stdin_is_tty, write_all_retry, NonBlockingStdin, PollResult, RawModeGuard,
+};
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
