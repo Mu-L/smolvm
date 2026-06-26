@@ -495,7 +495,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     "root DAX requires libkrun with krun_add_virtiofs3",
                 ));
             };
-            if add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), ROOTFS_DAX_WINDOW, false) < 0 {
+            if add_virtiofs3(
+                ctx,
+                root_tag.as_ptr(),
+                root.as_ptr(),
+                ROOTFS_DAX_WINDOW,
+                false,
+            ) < 0
+            {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
                     "set rootfs",
