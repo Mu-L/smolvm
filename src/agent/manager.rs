@@ -1708,6 +1708,23 @@ impl AgentManager {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
+        // Windows analogue: detach the VM from the launching process's console so
+        // it survives that shell closing (a closing console delivers
+        // CTRL_CLOSE_EVENT to attached processes, which would kill a detached
+        // persistent machine the moment `machine start` returns), and give it its
+        // own process group so a Ctrl-C in the launcher isn't forwarded.
+        //
+        // NB: an OpenSSH session wraps its processes in a job object with
+        // KILL_ON_JOB_CLOSE, so a machine started over `ssh ... cmd /c` still dies
+        // on disconnect — that's an SSH artifact, not present in a normal terminal
+        // or under the `serve` supervisor.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        }
         let child = cmd
             .spawn()
             .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
