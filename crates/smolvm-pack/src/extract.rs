@@ -13,6 +13,46 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
+/// Acquire a blocking, exclusive advisory lock on an open lock file.
+///
+/// Unix uses `flock(LOCK_EX)`; Windows uses `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK)`
+/// on the file handle. Without the Windows path, concurrent first-run
+/// extractions of the same checksum race. The lock is released when the OS
+/// closes the handle (i.e. when the `File` is dropped).
+#[cfg(unix)]
+fn lock_file_exclusive(lock_file: &fs::File) -> std::io::Result<()> {
+    let ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn lock_file_exclusive(lock_file: &fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let handle = lock_file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    // Lock the whole (empty) file: offset 0, maximum byte range.
+    let ret = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if ret == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Set a Unix file mode on `path`, ignoring errors. No-op on non-Unix targets
 /// (Windows has no POSIX mode bits).
 #[inline]
@@ -562,23 +602,15 @@ pub fn extract_sidecar(
     // Acquire an exclusive lock adjacent to the cache directory.
     // This serializes concurrent first-run extractions of the same checksum.
     let lock_path = cache_dir.with_extension("lock");
-    // Held open for the function's duration. On Unix it backs the `flock`
-    // below; on Windows there is no `flock` here, so the handle is unused but
-    // still kept alive (binding it suppresses the unused warning there).
-    #[cfg_attr(not(unix), allow(unused_variables))]
+    // Held open for the function's duration: backs the advisory lock below
+    // (flock on Unix, LockFileEx on Windows) and releases on drop.
     let lock_file = fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(&lock_path)?;
 
-    #[cfg(unix)]
-    {
-        let ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
-        if ret != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
+    lock_file_exclusive(&lock_file)?;
 
     // Double-check inside the lock: another process may have completed
     // extraction while we were waiting for the lock.
@@ -1399,13 +1431,7 @@ pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result
         .truncate(false)
         .open(&lock_path)?;
 
-    #[cfg(unix)]
-    {
-        let ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
-        if ret != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
+    lock_file_exclusive(&lock_file)?;
 
     // Re-check after acquiring lock (another process may have finished)
     if libs_cache_dir.join(LIBS_EXTRACTION_MARKER).exists() {
