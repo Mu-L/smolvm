@@ -61,7 +61,9 @@ mod win {
     pub fn process_is_alive(pid: u32) -> bool {
         match open(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
             Some(handle) => {
-                let alive = exit_code(handle).map(|c| c == STILL_RUNNING).unwrap_or(false);
+                let alive = exit_code(handle)
+                    .map(|c| c == STILL_RUNNING)
+                    .unwrap_or(false);
                 unsafe { CloseHandle(handle) };
                 alive
             }
@@ -123,9 +125,8 @@ mod win {
         let mut user = creation;
         // SAFETY: handle is a live process handle for the duration of the call;
         // all four FILETIME out-params are valid, writable locals.
-        let ok = unsafe {
-            GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
-        };
+        let ok =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
         unsafe { CloseHandle(handle) };
         if ok == 0 {
             None

@@ -92,9 +92,9 @@ use queues::NetworkFrameQueues;
 use queues::DEFAULT_FRAME_QUEUE_CAPACITY;
 #[cfg(unix)]
 use stack::{start_network_stack, VirtioPollConfig};
-use tcp_listeners::TcpPortListeners;
 #[cfg(unix)]
 use tcp_listeners::create_tcp_channel;
+use tcp_listeners::TcpPortListeners;
 
 /// Default upstream DNS resolver used by the gateway runtime.
 pub const DEFAULT_DNS_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));

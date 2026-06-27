@@ -4,6 +4,7 @@
 //! and receiving responses.
 
 use crate::error::{Error, Result};
+use crate::platform::uds::UdsStream;
 use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth};
 use crate::settings::SmolSettings;
 use smolvm_protocol::normalize_image_ref;
@@ -13,7 +14,6 @@ use smolvm_protocol::{
     PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
-use crate::platform::uds::UdsStream;
 use std::path::Path;
 use std::time::Duration;
 

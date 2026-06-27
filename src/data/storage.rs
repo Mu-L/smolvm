@@ -184,10 +184,7 @@ impl HostMount {
         // Guest paths are always Linux paths; check Linux-absolute (leading '/')
         // rather than `Path::is_absolute()`, which is host-platform-specific and
         // wrongly rejects "/data" on Windows (where absolute means `C:\...`).
-        let target_is_absolute = mount
-            .target
-            .to_str()
-            .is_some_and(|t| t.starts_with('/'));
+        let target_is_absolute = mount.target.to_str().is_some_and(|t| t.starts_with('/'));
         if !target_is_absolute {
             return Err(Error::mount(
                 "validate guest path",

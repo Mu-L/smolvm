@@ -95,7 +95,10 @@ pub fn launch_agent_vm_dynamic(
 
     // Set library path so libkrun can find libkrunfw. Only consumed by the
     // macos/linux env-var blocks below, so unused on other targets (Windows).
-    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(unused_variables))]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux")),
+        allow(unused_variables)
+    )]
     let lib_dir = config
         .rootfs_path
         .parent()
@@ -283,63 +286,63 @@ pub fn launch_agent_vm_dynamic(
             }
             #[cfg(unix)]
             {
-            let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
+                let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
                 "libkrun does not expose krun_add_net_unixstream; update libkrun or use --net-backend tsi"
                     .to_string()
             })?;
 
-            // virtio-net carries guest networking, but the host-guest control
-            // channel still rides vsock. Upstream libkrun no longer creates an
-            // implicit vsock, so add it explicitly (no TSI hijacking — virtio-net
-            // owns the network path); otherwise krun_add_vsock_port2 below fails
-            // with ENODEV.
-            if unsafe { (krun.add_vsock)(ctx, 0) } < 0 {
-                free_ctx_on_err!("krun_add_vsock failed");
-            }
+                // virtio-net carries guest networking, but the host-guest control
+                // channel still rides vsock. Upstream libkrun no longer creates an
+                // implicit vsock, so add it explicitly (no TSI hijacking — virtio-net
+                // owns the network path); otherwise krun_add_vsock_port2 below fails
+                // with ENODEV.
+                if unsafe { (krun.add_vsock)(ctx, 0) } < 0 {
+                    free_ctx_on_err!("krun_add_vsock failed");
+                }
 
-            let guest_network = GuestNetworkConfig::default();
-            let mut guest_mac = guest_network.guest_mac;
-            let (host_fd, guest_fd) =
-                create_unix_stream_pair().map_err(|e| format!("socketpair failed: {e}"))?;
-            let port_mappings: Vec<VirtioPortMapping> = config
-                .port_mappings
-                .iter()
-                .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
-                .collect();
-            let egress = smolvm_network::EgressPolicy::from_allowed_cidrs(
-                config.resources.allowed_cidrs.as_deref(),
-            );
+                let guest_network = GuestNetworkConfig::default();
+                let mut guest_mac = guest_network.guest_mac;
+                let (host_fd, guest_fd) =
+                    create_unix_stream_pair().map_err(|e| format!("socketpair failed: {e}"))?;
+                let port_mappings: Vec<VirtioPortMapping> = config
+                    .port_mappings
+                    .iter()
+                    .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
+                    .collect();
+                let egress = smolvm_network::EgressPolicy::from_allowed_cidrs(
+                    config.resources.allowed_cidrs.as_deref(),
+                );
 
-            let runtime = match start_virtio_network(host_fd, guest_network, &port_mappings, egress)
-            {
-                Ok(runtime) => runtime,
-                Err(err) => {
+                let runtime =
+                    match start_virtio_network(host_fd, guest_network, &port_mappings, egress) {
+                        Ok(runtime) => runtime,
+                        Err(err) => {
+                            // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.
+                            unsafe { libc::close(guest_fd) };
+                            return Err(format!("failed to start virtio network runtime: {err}"));
+                        }
+                    };
+
+                if unsafe {
+                    (add_net_unixstream)(
+                        ctx,
+                        std::ptr::null(),
+                        guest_fd,
+                        guest_mac.as_mut_ptr(),
+                        COMPAT_NET_FEATURES,
+                        0,
+                    )
+                } < 0
+                {
                     // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.
                     unsafe { libc::close(guest_fd) };
-                    return Err(format!("failed to start virtio network runtime: {err}"));
+                    free_ctx_on_err!("krun_add_net_unixstream failed");
                 }
-            };
 
-            if unsafe {
-                (add_net_unixstream)(
-                    ctx,
-                    std::ptr::null(),
-                    guest_fd,
-                    guest_mac.as_mut_ptr(),
-                    COMPAT_NET_FEATURES,
-                    0,
-                )
-            } < 0
-            {
-                // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.
-                unsafe { libc::close(guest_fd) };
-                free_ctx_on_err!("krun_add_net_unixstream failed");
-            }
+                virtio_network_runtime = Some(runtime);
 
-            virtio_network_runtime = Some(runtime);
-
-            tracing::info!("network backend: virtio-net");
-            Some(guest_network)
+                tracing::info!("network backend: virtio-net");
+                Some(guest_network)
             }
         }
     };

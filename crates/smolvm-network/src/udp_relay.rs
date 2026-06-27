@@ -33,10 +33,10 @@
 use crate::egress::EgressPolicy;
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
+use polling::{Event, Events};
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, UdpMetadata};
 use std::collections::HashMap;
-use polling::{Event, Events};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as HostUdpSocket};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
@@ -198,7 +198,10 @@ fn run_udp_relay(
         }
 
         let mut events = Events::new();
-        let _ = poller.wait(&mut events, Some(Duration::from_millis(RELAY_POLL_MAX_MS as u64)));
+        let _ = poller.wait(
+            &mut events,
+            Some(Duration::from_millis(RELAY_POLL_MAX_MS as u64)),
+        );
 
         // A pending notify is consumed by `wait`; nothing else to drain.
         let mut ready: Vec<bool> = vec![false; keys.len()];

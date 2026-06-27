@@ -422,7 +422,9 @@ impl PackRunCmd {
                 console_log: Some(console_log_path.clone()),
                 startup_error_log: runtime_dir.path().join("startup-error.log"),
                 storage_size_gb: storage_gib.unwrap_or(smolvm::storage::DEFAULT_STORAGE_SIZE_GIB),
-                overlay_size_gb: self.overlay.unwrap_or(smolvm::storage::DEFAULT_OVERLAY_SIZE_GIB),
+                overlay_size_gb: self
+                    .overlay
+                    .unwrap_or(smolvm::storage::DEFAULT_OVERLAY_SIZE_GIB),
                 mounts: mounts.clone(),
                 ports: self.port.clone(),
                 resources: resources.clone(),
@@ -1391,7 +1393,9 @@ fn run_from_cache(
             console_log: Some(console_log_path.clone()),
             startup_error_log: runtime_dir.path().join("startup-error.log"),
             storage_size_gb: storage_gib.unwrap_or(smolvm::storage::DEFAULT_STORAGE_SIZE_GIB),
-            overlay_size_gb: args.overlay.unwrap_or(smolvm::storage::DEFAULT_OVERLAY_SIZE_GIB),
+            overlay_size_gb: args
+                .overlay
+                .unwrap_or(smolvm::storage::DEFAULT_OVERLAY_SIZE_GIB),
             mounts: mounts.clone(),
             ports: args.port.clone(),
             resources: resources.clone(),

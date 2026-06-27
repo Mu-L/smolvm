@@ -387,9 +387,9 @@ fn run_network_stack(
         flush_interface_egress(&mut interface, &mut device, &mut sockets, now);
         wake_guest_if_needed(&queues, &device);
 
-        let timeout = interface.poll_delay(now, &sockets).map(|duration| {
-            Duration::from_millis(duration.total_millis().min(u32::MAX as u64))
-        });
+        let timeout = interface
+            .poll_delay(now, &sockets)
+            .map(|duration| Duration::from_millis(duration.total_millis().min(u32::MAX as u64)));
         let timeout = match timeout {
             Some(timeout) => Some(timeout),
             None => Some(Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS as u64)),

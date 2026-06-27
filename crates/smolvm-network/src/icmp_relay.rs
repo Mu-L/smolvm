@@ -37,6 +37,7 @@
 use crate::egress::EgressPolicy;
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
+use polling::{Event, Events};
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpProtocol, Ipv4Packet, Ipv4Repr,
@@ -45,7 +46,6 @@ use smoltcp::wire::{
 use socket2::{Domain, Protocol, SockAddr, Socket as HostSocket, Type};
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
-use polling::{Event, Events};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
@@ -224,7 +224,10 @@ fn run_icmp_relay(
         }
 
         let mut events = Events::new();
-        let _ = poller.wait(&mut events, Some(Duration::from_millis(RELAY_POLL_MAX_MS as u64)));
+        let _ = poller.wait(
+            &mut events,
+            Some(Duration::from_millis(RELAY_POLL_MAX_MS as u64)),
+        );
 
         // A pending notify is consumed by `wait`; nothing else to drain.
         let mut ready: Vec<bool> = vec![false; keys.len()];

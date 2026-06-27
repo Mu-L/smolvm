@@ -646,88 +646,88 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 }
                 #[cfg(unix)]
                 {
-                let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
+                    let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
                     Error::agent(
                         "configure virtio-net",
                         "libkrun does not expose krun_add_net_unixstream; update libkrun or use --net-backend tsi",
                     )
                 })?;
-                // virtio-net carries guest networking, but the host-guest control
-                // channel still rides vsock. Upstream libkrun no longer creates an
-                // implicit vsock, so add it explicitly (no TSI hijacking — virtio-net
-                // owns the network path); otherwise krun_add_vsock_port2 below fails
-                // with ENODEV.
-                if krun_add_vsock(ctx, 0) < 0 {
-                    krun_free_ctx(ctx);
-                    return Err(Error::agent("configure vsock", "krun_add_vsock failed"));
-                }
+                    // virtio-net carries guest networking, but the host-guest control
+                    // channel still rides vsock. Upstream libkrun no longer creates an
+                    // implicit vsock, so add it explicitly (no TSI hijacking — virtio-net
+                    // owns the network path); otherwise krun_add_vsock_port2 below fails
+                    // with ENODEV.
+                    if krun_add_vsock(ctx, 0) < 0 {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent("configure vsock", "krun_add_vsock failed"));
+                    }
 
-                let mut guest_network = GuestNetworkConfig::default();
-                // A custom resolver (--dns) becomes the gateway's upstream: the
-                // guest still points at the gateway (100.96.0.1), which forwards
-                // queries to this address instead of the default.
-                if let Some(dns) = resources.dns {
-                    guest_network.upstream_dns = dns;
-                }
-                let mut guest_mac = guest_network.guest_mac;
-                let (host_fd, guest_fd) = create_unix_stream_pair().map_err(|e| {
-                    Error::agent("configure virtio-net", format!("socketpair failed: {e}"))
-                })?;
+                    let mut guest_network = GuestNetworkConfig::default();
+                    // A custom resolver (--dns) becomes the gateway's upstream: the
+                    // guest still points at the gateway (100.96.0.1), which forwards
+                    // queries to this address instead of the default.
+                    if let Some(dns) = resources.dns {
+                        guest_network.upstream_dns = dns;
+                    }
+                    let mut guest_mac = guest_network.guest_mac;
+                    let (host_fd, guest_fd) = create_unix_stream_pair().map_err(|e| {
+                        Error::agent("configure virtio-net", format!("socketpair failed: {e}"))
+                    })?;
 
-                let virtio_port_mappings: Vec<VirtioPortMapping> = port_mappings
-                    .iter()
-                    .map(|mapping| VirtioPortMapping::new(mapping.host, mapping.guest))
-                    .collect();
-                let egress = smolvm_network::EgressPolicy::new(
-                    resources.allowed_cidrs.as_deref(),
-                    egress_refresh_hosts.as_deref(),
-                );
-                let runtime = match start_virtio_network(
-                    host_fd,
-                    guest_network,
-                    &virtio_port_mappings,
-                    egress,
-                ) {
-                    Ok(runtime) => runtime,
-                    Err(err) => {
+                    let virtio_port_mappings: Vec<VirtioPortMapping> = port_mappings
+                        .iter()
+                        .map(|mapping| VirtioPortMapping::new(mapping.host, mapping.guest))
+                        .collect();
+                    let egress = smolvm_network::EgressPolicy::new(
+                        resources.allowed_cidrs.as_deref(),
+                        egress_refresh_hosts.as_deref(),
+                    );
+                    let runtime = match start_virtio_network(
+                        host_fd,
+                        guest_network,
+                        &virtio_port_mappings,
+                        egress,
+                    ) {
+                        Ok(runtime) => runtime,
+                        Err(err) => {
+                            libc::close(guest_fd);
+                            krun_free_ctx(ctx);
+                            return Err(Error::agent(
+                                "configure virtio-net",
+                                format!("failed to start virtio network runtime: {err}"),
+                            ));
+                        }
+                    };
+
+                    if add_net_unixstream(
+                        ctx,
+                        std::ptr::null(),
+                        guest_fd,
+                        guest_mac.as_mut_ptr(),
+                        COMPAT_NET_FEATURES,
+                        0,
+                    ) < 0
+                    {
                         libc::close(guest_fd);
                         krun_free_ctx(ctx);
                         return Err(Error::agent(
                             "configure virtio-net",
-                            format!("failed to start virtio network runtime: {err}"),
+                            "krun_add_net_unixstream failed",
                         ));
                     }
-                };
 
-                if add_net_unixstream(
-                    ctx,
-                    std::ptr::null(),
-                    guest_fd,
-                    guest_mac.as_mut_ptr(),
-                    COMPAT_NET_FEATURES,
-                    0,
-                ) < 0
-                {
-                    libc::close(guest_fd);
-                    krun_free_ctx(ctx);
-                    return Err(Error::agent(
-                        "configure virtio-net",
-                        "krun_add_net_unixstream failed",
-                    ));
-                }
+                    // Flush this NIC's egress counter to the per-VM dir so serve can
+                    // bill it (parity with how disk size reaches the node API).
+                    if let Some(path) = egress_telemetry {
+                        crate::agent::manager::spawn_egress_flush(
+                            path.to_path_buf(),
+                            runtime.egress_counter(),
+                        );
+                    }
+                    virtio_network_runtime = Some(runtime);
 
-                // Flush this NIC's egress counter to the per-VM dir so serve can
-                // bill it (parity with how disk size reaches the node API).
-                if let Some(path) = egress_telemetry {
-                    crate::agent::manager::spawn_egress_flush(
-                        path.to_path_buf(),
-                        runtime.egress_counter(),
-                    );
-                }
-                virtio_network_runtime = Some(runtime);
-
-                tracing::info!("network backend: virtio-net");
-                Some(guest_network)
+                    tracing::info!("network backend: virtio-net");
+                    Some(guest_network)
                 }
             }
         };
