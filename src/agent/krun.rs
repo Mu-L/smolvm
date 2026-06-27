@@ -89,10 +89,8 @@ impl KrunFunctions {
         // resolve it later by soname; `libloading` only exposes that via the
         // os-specific `Library::open`. On Windows there is no RTLD_GLOBAL
         // concept, so a plain `Library::new` is used.
-        let fw_handle =
-            load_library_global(&fw_lib_path).map_err(|e| {
-                format!("failed to load {}: {}", fw_lib_path.display(), e)
-            })?;
+        let fw_handle = load_library_global(&fw_lib_path)
+            .map_err(|e| format!("failed to load {}: {}", fw_lib_path.display(), e))?;
 
         let lib_path = lib_dir.join(libkrun_filename());
         // RTLD_LAZY (not RTLD_NOW) on Unix: a single libkrun built with the GPU
@@ -120,7 +118,8 @@ impl KrunFunctions {
         macro_rules! load_optional_sym {
             ($name:literal) => {{
                 match handle.get::<*mut std::ffi::c_void>(concat!($name, "\0").as_bytes()) {
-                    Ok(sym) => {
+                    Ok(sym) =>
+                    {
                         #[allow(clippy::missing_transmute_annotations)]
                         Some(std::mem::transmute(*sym))
                     }
@@ -213,6 +212,10 @@ impl KrunFunctions {
     /// Windows stub: the virtio-console redirection relies on POSIX file
     /// descriptors passed to libkrun. The Windows libkrun ABI/console wiring is
     /// not implemented here, so this is a no-op that reports failure.
+    ///
+    /// # Safety
+    /// `unsafe` only to match the Unix signature (which dereferences libkrun
+    /// function pointers). This stub touches nothing and is always sound to call.
     #[cfg(not(unix))]
     pub unsafe fn console_output_to_file(&self, _ctx: u32, _path: &Path) -> i32 {
         -1

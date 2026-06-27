@@ -49,6 +49,28 @@ impl UdsStream {
         Ok((Self { inner: a }, Self { inner: b }))
     }
 
+    /// Create a connected pair of stream sockets (Windows test helper).
+    ///
+    /// Windows has no AF_UNIX `socketpair`, so this returns a loopback TCP pair.
+    /// The agent-client unit tests only push bytes through a connected bidi
+    /// stream, so the transport is interchangeable here.
+    #[cfg(windows)]
+    pub fn pair() -> io::Result<(Self, Self)> {
+        use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+        let addr = listener.local_addr()?;
+        let a = TcpStream::connect(addr)?;
+        let (b, _) = listener.accept()?;
+        Ok((
+            Self {
+                inner: Socket::from(a),
+            },
+            Self {
+                inner: Socket::from(b),
+            },
+        ))
+    }
+
     /// Set the read timeout. `None` disables the timeout (blocking).
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         self.inner.set_read_timeout(dur)

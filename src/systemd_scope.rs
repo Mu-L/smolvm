@@ -56,7 +56,7 @@ pub fn is_available() -> bool {
     // systemd scopes are a Linux-only concept; never available elsewhere.
     #[cfg(not(target_os = "linux"))]
     {
-        return false;
+        false
     }
     #[cfg(target_os = "linux")]
     {
