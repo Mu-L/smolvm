@@ -333,7 +333,7 @@ impl AssetCollector {
         // On Windows/NTFS, File::create makes a dense file; seeking past the end
         // and writing a tail byte would allocate every intermediate block.
         #[cfg(windows)]
-        mark_file_sparse(&file)?;
+        crate::extract::mark_file_sparse(&file)?;
         file.seek(SeekFrom::Start(TEMPLATE_SIZE - 1))?;
         file.write_all(&[0])?;
         file.sync_all()?;
@@ -360,11 +360,24 @@ impl AssetCollector {
                 }
             })
             .ok_or_else(|| {
-                PackError::AssetNotFound(
-                    "mkfs.ext4 not found. Install e2fsprogs or place a pre-formatted \
-                     storage-template.ext4 in ~/.smolvm/"
-                        .into(),
-                )
+                // Windows has no host mkfs.ext4, so point the user at the
+                // guest-VM recipe for staging a template (the agent rootfs has
+                // e2fsprogs). On Unix the fix is just installing e2fsprogs.
+                #[cfg(windows)]
+                let msg = "storage-template.ext4 not found, and Windows has no host \
+                     mkfs.ext4 to create one. Format a small template inside a guest VM \
+                     once and place it next to smolvm.exe (or in %USERPROFILE%\\.smolvm\\):\n  \
+                     smolvm machine create --name mktmpl --volume <dir>:/out\n  \
+                     smolvm machine start --name mktmpl\n  \
+                     smolvm machine exec --name mktmpl -- /bin/busybox sh -c \
+                     \"truncate -s 512M /out/storage-template.ext4 && \
+                     mkfs.ext4 -F -q -m 0 /out/storage-template.ext4\"\n  \
+                     smolvm machine delete --name mktmpl --force\n  \
+                     then copy <dir>\\storage-template.ext4 next to smolvm.exe";
+                #[cfg(not(windows))]
+                let msg = "mkfs.ext4 not found. Install e2fsprogs or place a pre-formatted \
+                     storage-template.ext4 in ~/.smolvm/";
+                PackError::AssetNotFound(msg.into())
             })?;
 
         // Format with ext4
@@ -503,39 +516,6 @@ impl AssetCollector {
 // Sparse-aware overlay copy
 // =============================================================================
 
-/// Mark an open file as sparse (Windows/NTFS) so a later `set_len` to a large
-/// size followed by writes at high offsets doesn't allocate every intermediate
-/// block. Unix filesystems are sparse by default and never call this.
-///
-/// `smolvm-pack` cannot depend on the main crate, so this mirrors the FSCTL
-/// approach in the main crate's `src/disk_utils.rs::mark_file_sparse`.
-#[cfg(windows)]
-fn mark_file_sparse(file: &std::fs::File) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::System::IO::DeviceIoControl;
-    // FSCTL_SET_SPARSE control code (winioctl.h).
-    const FSCTL_SET_SPARSE: u32 = 0x000900C4;
-    let mut returned: u32 = 0;
-    // SAFETY: `file` is a valid open handle; FSCTL_SET_SPARSE uses no in/out buffers.
-    let ok = unsafe {
-        DeviceIoControl(
-            file.as_raw_handle(),
-            FSCTL_SET_SPARSE,
-            std::ptr::null(),
-            0,
-            std::ptr::null_mut(),
-            0,
-            &mut returned,
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
 /// Copy a sparse overlay disk to `dst`, stripping trailing zeros.
 ///
 /// Scans backwards from the end of the source to find the last non-zero byte,
@@ -567,7 +547,7 @@ fn sparse_copy_overlay(src: &Path, dst: &Path) -> std::io::Result<(u64, u64)> {
     // of real disk. Mark it sparse first so only written extents consume space —
     // matching the implicit sparse behavior of Unix filesystems.
     #[cfg(windows)]
-    mark_file_sparse(&dst_file)?;
+    crate::extract::mark_file_sparse(&dst_file)?;
     dst_file.set_len(truncated_size)?;
 
     if truncated_size == 0 {

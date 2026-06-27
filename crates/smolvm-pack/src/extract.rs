@@ -22,7 +22,7 @@ use std::os::unix::io::AsRawFd;
 /// `smolvm-pack` cannot depend on the main crate, so this mirrors the FSCTL
 /// approach in the main crate's `src/disk_utils.rs::mark_file_sparse`.
 #[cfg(windows)]
-fn mark_file_sparse(file: &fs::File) -> std::io::Result<()> {
+pub(crate) fn mark_file_sparse(file: &fs::File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::IO::DeviceIoControl;
     // FSCTL_SET_SPARSE control code (winioctl.h).
