@@ -21,12 +21,39 @@ pub fn control_socket_path(name: &str) -> PathBuf {
     vm_data_dir(name).join("control.sock")
 }
 
+/// Connect to a libkrun control socket.
+///
+/// On Unix this is an `AF_UNIX` stream socket bound at `sock`. Windows has no
+/// `AF_UNIX` listener in libkrun: it binds a TCP loopback listener and writes
+/// the OS-assigned port (decimal text) into `sock`, so we read that port and
+/// connect over TCP. Either way the result is a [`UdsStream`] wrapping the
+/// connected socket, so callers share one code path.
+#[cfg(not(windows))]
+fn connect_control_socket(sock: &Path) -> std::io::Result<crate::platform::uds::UdsStream> {
+    crate::platform::uds::UdsStream::connect(sock)
+}
+
+#[cfg(windows)]
+fn connect_control_socket(sock: &Path) -> std::io::Result<crate::platform::uds::UdsStream> {
+    use std::net::{Ipv4Addr, TcpStream};
+    let port_text = std::fs::read_to_string(sock)?;
+    let port: u16 = port_text.trim().parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("control socket port file {}: {e}", sock.display()),
+        )
+    })?;
+    let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port))?;
+    Ok(crate::platform::uds::UdsStream::from_socket(
+        socket2::Socket::from(tcp),
+    ))
+}
+
 /// Send a single line command to a VM control socket and return its reply line.
 pub fn control_socket_cmd(sock: &Path, cmd: &str) -> Result<String> {
-    use crate::platform::uds::UdsStream;
     use std::io::{Read, Write};
 
-    let mut stream = UdsStream::connect(sock)
+    let mut stream = connect_control_socket(sock)
         .map_err(|e| Error::agent("connect control socket", e.to_string()))?;
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(60)))
@@ -284,9 +311,13 @@ fn clone_fork_disks(gdir: &Path, clone_dir: &Path) -> Result<()> {
             }
         }
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     {
-        // macOS uses clonefile (APFS CoW), keeping the golden's disk format.
+        // No libkrun qcow2 overlay off Linux, so the clone gets its own copy of
+        // the golden's disks: macOS clonefiles them (APFS CoW, instant), Windows
+        // sparse-copies them (NTFS sparse, so a large-virtual template stays
+        // small). Both keep the golden's disk format and copy the `.formatted`
+        // marker so the clone never reformats the inherited filesystem.
         for (_, src, _) in &disks {
             let dst = clone_dir.join(src.file_name().unwrap());
             crate::disk_utils::clone_or_copy_file(src, &dst)
@@ -297,17 +328,6 @@ fn clone_fork_disks(gdir: &Path, clone_dir: &Path) -> Result<()> {
             }
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        // Fork-clone disk overlays rely on libkrun's qcow2 overlay (Linux) or
-        // APFS clonefile (macOS); neither is wired up on Windows.
-        let _ = (&disks, clone_dir);
-        return Err(Error::agent(
-            "clone disk",
-            "live fork is not supported on this platform",
-        ));
-    }
-    #[allow(unreachable_code)]
     Ok(())
 }
 
