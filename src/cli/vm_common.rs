@@ -689,6 +689,24 @@ pub fn fork_vm(
 ) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
 
+    // Validate the golden exists and is a live fork base BEFORE announcing the
+    // freeze, so a typo'd or non-forkable golden errors cleanly instead of
+    // printing "Freezing golden '<name>'..." for a golden that was never
+    // touched. These mirror `prepare_fork`'s first two golden checks (which
+    // re-validates authoritatively, incl. socket responsiveness).
+    if db.get_vm(golden)?.is_none() {
+        return Err(smolvm::Error::vm_not_found(golden));
+    }
+    if !smolvm::agent::fork::control_socket_path(golden).exists() {
+        return Err(smolvm::Error::agent(
+            "fork",
+            format!(
+                "golden '{golden}' is not running forkable; start it with \
+                 `machine start --forkable --name {golden}`"
+            ),
+        ));
+    }
+
     // Freeze + snapshot the golden, register the clone (CoW disks + DB record).
     // The launch-agnostic mechanics live in the lib (`agent::fork`) so the CLI
     // and the serve API share one implementation.

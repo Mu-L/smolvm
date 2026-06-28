@@ -200,19 +200,37 @@ test_machine_run_virtio_net_port_publishing_works() {
     cleanup_machine
 }
 
-test_machine_create_virtio_net_policy_rejected() {
+# virtio-net enforces the full egress allow-list (host-side smolvm-network
+# stack), so `--net-backend virtio-net` + `--allow-cidr` is accepted.
+test_machine_create_virtio_net_policy_accepted() {
     cleanup_machine
     local vm_name="virtio-policy-test-$$"
     local exit_code=0
     local output
 
     output=$($SMOLVM machine create --name "$vm_name" --net --net-backend virtio-net --allow-cidr 1.1.1.1/32 2>&1) || exit_code=$?
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+    [[ $exit_code -eq 0 ]] || {
+        echo "expected virtio-net + egress policy to be accepted; got: $output"
+        return 1
+    }
+}
+
+# Explicit TSI cannot enforce an egress allow-list (its in-libkrun filter is a
+# no-op for allow-cidr), so `--net-backend tsi` + `--allow-cidr` is rejected.
+test_machine_create_tsi_policy_rejected() {
+    cleanup_machine
+    local vm_name="tsi-policy-test-$$"
+    local exit_code=0
+    local output
+
+    output=$($SMOLVM machine create --name "$vm_name" --net --net-backend tsi --allow-cidr 1.1.1.1/32 2>&1) || exit_code=$?
     [[ $exit_code -ne 0 ]] || {
-        echo "expected create failure for virtio-net policy request"
+        echo "expected explicit TSI + egress policy to be rejected"
         $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
-    [[ "$output" == *"allow-cidr/allow-host policies are not supported"* ]] || {
+    [[ "$output" == *"requires the virtio-net backend"* ]] || {
         echo "unexpected output: $output"
         return 1
     }
@@ -248,7 +266,8 @@ run_test "Machine create: virtio-net works" test_machine_create_virtio_net_works
 run_test "Machine create/start/exec: virtio-net guest networking works" test_machine_create_start_exec_virtio_net_works || true
 run_test "Machine run: virtio-net guest networking works" test_machine_run_virtio_net_works || true
 run_test "Machine run: virtio-net published TCP ports work" test_machine_run_virtio_net_port_publishing_works || true
-run_test "Machine create: virtio-net + policy rejected" test_machine_create_virtio_net_policy_rejected || true
+run_test "Machine create: virtio-net + egress policy accepted" test_machine_create_virtio_net_policy_accepted || true
+run_test "Machine create: explicit TSI + egress policy rejected" test_machine_create_tsi_policy_rejected || true
 run_test "Pack run: virtio-net guest networking works" test_pack_run_virtio_net_works || true
 
 print_summary "Virtio-Net Tests"
