@@ -1123,6 +1123,16 @@ impl RunCmd {
         let sigint_guard = manager.child_pid().map(smolvm::process::SigintGuard::new);
 
         // Resolve image: CLI > Smolfile > None (bare VM)
+        // When Rosetta is enabled, default the image pull to linux/amd64 so there
+        // is an x86_64 binary to translate; an explicit --oci-platform still wins.
+        // Without this, a multi-arch image resolves to the guest-native arm64
+        // variant and Rosetta has nothing to do.
+        let rosetta_requested = self.rosetta || params.rosetta;
+        let effective_platform: Option<String> = self
+            .oci_platform
+            .clone()
+            .or_else(|| rosetta_requested.then(|| "linux/amd64".to_string()));
+
         // Pull only registry images; a local source's layers are already
         // mounted via virtiofs and the guest assembles its rootfs from them.
         let image_info = if uses_packed_layers {
@@ -1131,7 +1141,7 @@ impl RunCmd {
             match crate::cli::pull_with_progress(
                 &mut client,
                 img,
-                self.oci_platform.as_deref(),
+                effective_platform.as_deref(),
                 self.proxy_opts.proxy(),
                 self.proxy_opts.no_proxy(),
             ) {

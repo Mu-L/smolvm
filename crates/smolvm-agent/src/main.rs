@@ -87,6 +87,7 @@ mod process;
 #[cfg(target_os = "linux")]
 mod pty;
 mod retry;
+mod rosetta;
 mod ssh_agent;
 mod storage;
 #[cfg(target_os = "linux")]
@@ -401,6 +402,14 @@ fn main() {
         ssh_agent::start();
         // Set env so all child processes (git, ssh, etc.) find the agent socket
         std::env::set_var("SSH_AUTH_SOCK", ssh_agent::GUEST_SSH_AUTH_SOCK);
+    }
+
+    // Mount the Rosetta 2 runtime and register the binfmt_misc handler if the
+    // host attached it. Must run after pivot_root (the wrapper lives in the
+    // rootfs) and after /proc is mounted (binfmt_misc registration).
+    if rosetta::is_enabled() {
+        info!("Rosetta 2 requested, setting up x86_64 translation");
+        rosetta::setup();
     }
 
     // Start DNS filtering proxy if enabled by host (when --allow-host is used)
@@ -3140,6 +3149,7 @@ fn write_oci_bundle(
     storage::add_storage_fallback(&mut spec, mounts, unprivileged);
 
     ssh_agent::inject_into_container(&mut spec);
+    rosetta::inject_into_container(&mut spec);
     spec.write_to(bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;
 
@@ -3895,6 +3905,7 @@ fn spawn_interactive_command(
 
     // Forward SSH agent into the container if enabled at boot.
     ssh_agent::inject_into_container(&mut spec);
+    rosetta::inject_into_container(&mut spec);
 
     spec.write_to(&bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;

@@ -20,11 +20,12 @@
 
 use crate::platform::{self, RosettaSupport};
 
-/// Virtiofs tag for the Rosetta mount.
-pub const ROSETTA_TAG: &str = "rosetta";
+/// Virtiofs tag for the Rosetta mount. Re-exported from the wire protocol so the
+/// host launcher and guest agent share one definition.
+pub use smolvm_protocol::ROSETTA_TAG;
 
-/// Guest mount path for Rosetta runtime.
-pub const ROSETTA_GUEST_PATH: &str = "/mnt/rosetta";
+/// Guest mount path for the Rosetta runtime. Re-exported from the wire protocol.
+pub use smolvm_protocol::ROSETTA_GUEST_PATH;
 
 /// binfmt_misc registration command for the guest.
 ///
