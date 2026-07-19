@@ -77,7 +77,41 @@ fn spawn_idle_watchdog(active: Arc<AtomicUsize>, timeout: Duration) {
 /// thread against a fresh backend — all in this process, so they share one GPU
 /// context. Returns only on listener failure; otherwise exits via the idle
 /// watchdog (or runs until the host shuts down when the timeout is disabled).
+/// Fatal-signal backtrace: the daemon and its clone workers host large unsafe
+/// surfaces (the CUDA driver itself, raw-pointer translation, IPC mappings). A
+/// SIGSEGV/SIGABRT/SIGBUS here previously died SILENTLY — a daemon segfault
+/// under concurrent 7B vLLM engines left a 933-byte log and no evidence. The
+/// handler writes the signal and a native backtrace to stderr (async-signal-
+/// unsafe in principle, but we are crashing anyway — best-effort output beats
+/// none) and then re-raises with the default action so wait() sees the truth.
+#[cfg(unix)]
+pub(crate) fn install_crash_handler(role: &'static str) {
+    static ROLE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    let _ = ROLE.set(role);
+    unsafe extern "C" fn on_fatal(sig: libc::c_int) {
+        let role = ROLE.get().copied().unwrap_or("cuda-proc");
+        eprintln!("[{role}] FATAL signal {sig}; backtrace:");
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+    for sig in [libc::SIGSEGV, libc::SIGABRT, libc::SIGBUS, libc::SIGILL] {
+        // SAFETY: installing a handler that only formats + re-raises.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_fatal as *const () as usize;
+            sa.sa_flags = libc::SA_ONSTACK;
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Serve the shared CUDA daemon on `sock` (spawned as `smolvm _cuda-daemon`).
 pub fn run(sock: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    install_crash_handler("cuda-daemon");
     if let Some(parent) = sock.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -226,6 +260,7 @@ fn make_backend() -> Box<dyn Backend> {
 /// hook in before the serve loop; establishing the process boundary comes first.
 pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     use std::os::unix::io::FromRawFd;
+    install_crash_handler("cuda-clone-worker");
     let mut backend = make_backend();
     // Our own primary context (separate process ⇒ own UVA), so we can place memory
     // at the golden's exact VAs.
@@ -593,7 +628,7 @@ fn reconstruct_golden_modules(
     path: &str,
 ) -> (
     Vec<(u64, Vec<u8>)>,
-    Vec<(u64, u64, String)>,
+    Vec<smolvm_cuda::host::FuncMeta>,
     Vec<(u64, u64)>,
     Vec<(u64, u64)>,
     Vec<(u64, u64, smolvm_cuda::host::GraphSer)>,
@@ -664,7 +699,14 @@ fn reconstruct_golden_modules(
         need!(nlen);
         let name = String::from_utf8_lossy(&buf[p..p + nlen]).into_owned();
         p += nlen;
-        func_meta.push((gf, gm, name));
+        let nattrs = ru32!();
+        let mut attrs = Vec::with_capacity(nattrs as usize);
+        for _ in 0..nattrs {
+            let a = ru32!() as i32;
+            let v = ru32!() as i32;
+            attrs.push((a, v));
+        }
+        func_meta.push((gf, gm, name, attrs));
     }
     // Streams + events: recreate each with its golden create flags in OUR context,
     // mapping the golden's inherited raw handle → our own (same M3a pattern).
@@ -1177,11 +1219,18 @@ fn spawn_clone_worker(
             blob.extend_from_slice(img);
         }
         blob.extend_from_slice(&(funcs.len() as u32).to_le_bytes());
-        for (h, m, n) in &funcs {
+        for (h, m, n, attrs) in &funcs {
             blob.extend_from_slice(&h.to_le_bytes());
             blob.extend_from_slice(&m.to_le_bytes());
             blob.extend_from_slice(&(n.len() as u32).to_le_bytes());
             blob.extend_from_slice(n.as_bytes());
+            // Per-function attribute replays ([i32 attr][i32 value] each) —
+            // e.g. FlashAttention's MaxDynamicSharedMemorySize opt-in.
+            blob.extend_from_slice(&(attrs.len() as u32).to_le_bytes());
+            for &(a, v) in attrs {
+                blob.extend_from_slice(&a.to_le_bytes());
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
         }
         // Streams + events: [u64 golden handle][u32 create flags] each.
         blob.extend_from_slice(&(streams.len() as u32).to_le_bytes());
