@@ -936,7 +936,11 @@ pub extern "C" fn cudaMallocHost(ptr: *mut *mut c_void, size: usize) -> c_int {
 // offset (see do_memcpy). Falls back to plain host memory when the region is
 // absent or exhausted.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+// Every use of the bare `Ordering` name in this file sits on a Linux-only
+// path, so importing it unconditionally warns on a macOS dev host.
+#[cfg(target_os = "linux")]
+use std::sync::atomic::Ordering;
 
 static SHM_NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -2742,7 +2746,9 @@ pub extern "C" fn cudaDeviceGetPCIBusId(buf: *mut c_char, len: c_int, _device: c
     let id = b"0000:01:00.0\0";
     if !buf.is_null() && len > 0 {
         let n = (len as usize - 1).min(id.len() - 1);
-        unsafe { std::ptr::copy_nonoverlapping(id.as_ptr() as *const c_char, buf, n) };
+        // `.cast()`: c_char is u8 on aarch64 Linux (making `as` a no-op cast
+        // clippy rejects) but i8 elsewhere.
+        unsafe { std::ptr::copy_nonoverlapping(id.as_ptr().cast::<c_char>(), buf, n) };
         unsafe { *buf.add(n) = 0 };
     }
     set_last(CUDA_SUCCESS)
