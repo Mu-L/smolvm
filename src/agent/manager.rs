@@ -1711,7 +1711,7 @@ impl AgentManager {
         let fork_env: Vec<(&str, String)> = {
             let mut v = Vec::new();
             if features.forkable {
-                v.push(("SMOLVM_FORKABLE", "1".to_string()));
+                v.push((smolvm_protocol::guest_env::FORKABLE, "1".to_string()));
             }
             // Embedder override for the control socket path; without it the
             // launcher defaults to control.sock in the per-VM dir.
@@ -1736,7 +1736,10 @@ impl AgentManager {
                 v.push(("SMOLVM_CUDA_CLONE_SHARE", "1".to_string()));
             }
             if let Some(pool_size) = features.cuda_fork_pool_size {
-                v.push(("SMOLVM_CUDA_FORK_POOL_SIZE", pool_size.to_string()));
+                v.push((
+                    smolvm_protocol::guest_env::CUDA_FORK_POOL_SIZE,
+                    pool_size.to_string(),
+                ));
             }
             if let Some(limit_mib) = features.cuda_vram_limit_mib {
                 v.push(("SMOLVM_CUDA_VRAM_LIMIT_MB", limit_mib.to_string()));
@@ -2477,9 +2480,14 @@ impl AgentManager {
                     let mut inner = self.inner.lock();
                     if let Some(ref mut child) = inner.child {
                         if !child.is_running() {
+                            let exit_code = child.exit_code();
+                            let log = std::fs::read_to_string(&self.startup_error_log)
+                                .ok()
+                                .map(|content| content.trim().to_string())
+                                .filter(|content| !content.is_empty());
                             return Err(Error::agent(
                                 "monitor agent",
-                                "clone agent process exited during startup".to_string(),
+                                boot_failure_reason(exit_code, log.as_deref()),
                             ));
                         }
                     }
