@@ -127,7 +127,9 @@ pub fn ensure_running_and_connect(
 /// prints a one-line notice when recovery actually runs. The shared
 /// helper is silent (the HTTP API doesn't have a stdout to write
 /// to); CLI callers want the operator to see the zombie teardown.
-fn cli_recover_if_unreachable(name: &str) {
+/// A failed recovery propagates: the caller must not report the
+/// machine as stopped, detach its volumes, or start over the zombie.
+fn cli_recover_if_unreachable(name: &str) -> smolvm::Result<()> {
     // Peek at the record before recovery so we can show the PID in
     // the notice. Losing the PID after recovery is fine — the DB
     // gets cleared — but we want the operator to know *which*
@@ -137,7 +139,7 @@ fn cli_recover_if_unreachable(name: &str) {
         .and_then(|db| db.get_vm(name).ok().flatten())
         .and_then(|r| r.pid);
 
-    if smolvm::agent::state_probe::recover_if_unreachable(name) {
+    if smolvm::agent::state_probe::recover_if_unreachable(name)? {
         println!(
             "Machine '{}' is unreachable (PID {} alive but agent unresponsive); \
              cleaning up.",
@@ -145,6 +147,7 @@ fn cli_recover_if_unreachable(name: &str) {
             pid_for_notice.unwrap_or(0)
         );
     }
+    Ok(())
 }
 
 /// If the VM record says `Running` and the libkrun PID is alive but
@@ -1054,7 +1057,9 @@ fn start_vm_named_with_db(
         RecordState::Unreachable => {
             // Zombie VMM: kill it, clear the record, fall through to
             // a clean fresh start.
-            cli_recover_if_unreachable(name);
+            // If the zombie cannot be confirmed dead, fail instead of
+            // starting on top of it (socket/pid-file conflicts).
+            cli_recover_if_unreachable(name)?;
         }
         RecordState::Frozen => {
             // Snapshot-frozen fork base: relaunching it writable would
@@ -1536,7 +1541,9 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
     // try_connect_existing failed — could be "really stopped" or
     // "zombie VMM with dead agent". Recover the zombie case before
     // starting fresh; no-op otherwise.
-    cli_recover_if_unreachable("default");
+    // A failed recovery must abort the start: booting over a live
+    // zombie would collide on its sockets and pid files.
+    cli_recover_if_unreachable("default")?;
 
     eprintln!("Starting machine 'default'...");
     manager.ensure_running()?;
@@ -1639,7 +1646,10 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
     let resolved = smolvm::agent::state_probe::resolve_state(name, &record);
     match resolved {
         RecordState::Unreachable => {
-            cli_recover_if_unreachable(name);
+            // Only past this point is the zombie confirmed dead. On
+            // failure we return the error without claiming the machine
+            // stopped and without detaching its volumes.
+            cli_recover_if_unreachable(name)?;
             // Process is gone — detach the layers volume so a non-running
             // machine never holds a mount (invariant: mounted iff running).
             // macOS hdiutil detach; a no-op on Linux.
@@ -1818,9 +1828,26 @@ pub struct DeleteVmOptions {
     pub cascade: bool,
 }
 
+fn remove_vm_data_and_record(
+    db: &SmolvmDb,
+    name: &str,
+    data_dir: &std::path::Path,
+) -> smolvm::Result<()> {
+    if data_dir.exists() {
+        std::fs::remove_dir_all(data_dir).map_err(|e| {
+            smolvm::Error::storage(
+                "delete machine data",
+                format!("{}: {e}", data_dir.display()),
+            )
+        })?;
+    }
+    db.remove_vm(name)?;
+    Ok(())
+}
+
 /// Delete a named machine configuration.
 pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::Result<()> {
-    let mut config = SmolvmConfig::load()?;
+    let config = SmolvmConfig::load()?;
 
     // Check if exists
     let record = config
@@ -1849,9 +1876,6 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
                     },
                 )?;
             }
-            // The clone deletes above rewrote the config on disk; reload so the
-            // golden's own removal below persists against current state.
-            config = SmolvmConfig::load()?;
         } else if !force {
             return Err(smolvm::Error::agent(
                 "delete",
@@ -1879,11 +1903,14 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     if options.stop_if_running {
         match smolvm::agent::state_probe::resolve_state(name, &record) {
             RecordState::Running => {
-                if let Ok(manager) = AgentManager::for_vm(name) {
-                    println!("Stopping machine '{}'...", name);
-                    if let Err(e) = manager.stop() {
-                        tracing::warn!(error = %e, "failed to stop machine");
-                    }
+                let manager = AgentManager::for_vm(name)?;
+                println!("Stopping machine '{}'...", name);
+                manager.stop()?;
+                if record.pid.is_some_and(smolvm::process::is_alive) {
+                    return Err(smolvm::Error::agent(
+                        "delete machine",
+                        format!("machine '{name}' process is still alive after stop"),
+                    ));
                 }
             }
             RecordState::Unreachable => {
@@ -1892,7 +1919,7 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
                 // was given. The guarded `cli_recover_if_unreachable` would
                 // skip a frozen fork base, orphaning its VMM after we remove
                 // the record below.
-                smolvm::agent::state_probe::recover_unreachable_machine(&record);
+                smolvm::agent::state_probe::recover_unreachable_machine(&record)?;
             }
             RecordState::Frozen => {
                 // A frozen fork base only reaches here under --force (the
@@ -1900,7 +1927,7 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
                 // Reap its paused VMM so it isn't orphaned once the record
                 // is removed; the clones' overlays are left dangling, as
                 // the force-delete warning already states.
-                smolvm::agent::state_probe::recover_unreachable_machine(&record);
+                smolvm::agent::state_probe::recover_unreachable_machine(&record)?;
             }
             _ => {}
         }
@@ -1923,9 +1950,6 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
         }
     }
 
-    // Remove from config (persists immediately to database)
-    config.remove_vm(name);
-
     // If the machine was created from a .smolmachine, detach its case-sensitive
     // layers volume (macOS hdiutil mount; no-op on Linux) before removing the
     // data dir below — otherwise the `rm -rf` fails with "Resource busy". The
@@ -1945,10 +1969,11 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
         // Release this VM's per-VM uid (if any) before the dir holding its
         // `.vm-uid` record is removed. See process::free_vm_uid.
         smolvm::process::free_vm_uid(&smolvm::agent::vm_uid_registry_dir(), &data_dir);
-        if let Err(e) = std::fs::remove_dir_all(&data_dir) {
-            tracing::warn!(error = %e, "Failed to remove VM data directory: {}", data_dir.display());
-        }
     }
+
+    // Keep the record until process death and storage removal are both confirmed,
+    // so a failed delete remains visible and can be retried safely.
+    remove_vm_data_and_record(&SmolvmDb::open()?, name, &data_dir)?;
 
     // The VM's readiness marker lives in the *shared* agent rootfs, not its data
     // dir, so the removal above doesn't take it. Sweep it (and any other markers
@@ -2482,6 +2507,20 @@ mod init_runner_tests {
             "cap limits how many are reaped per call"
         );
         assert!(orphaned_ephemeral_names(&vms, alive, 0).is_empty());
+    }
+
+    #[test]
+    fn failed_data_removal_preserves_machine_record() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        let name = "delete-failure";
+        let record = VmRecord::new(name.to_string(), 1, 256, vec![], vec![], false);
+        db.insert_vm(name, &record).unwrap();
+
+        let data_path = dir.path().join("not-a-directory");
+        std::fs::write(&data_path, b"occupied").unwrap();
+        assert!(remove_vm_data_and_record(&db, name, &data_path).is_err());
+        assert!(db.get_vm(name).unwrap().is_some());
     }
 
     fn sample_image_info(env: Vec<&str>, workdir: Option<&str>, user: Option<&str>) -> ImageInfo {
