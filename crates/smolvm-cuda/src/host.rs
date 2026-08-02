@@ -898,8 +898,10 @@ struct GoldenLayout {
     /// LayerNorm activations packed into partial chunks). A kernel write
     /// changes content → CRC mismatch → the chunk degrades to private.
     maps: HashMap<u64, ChunkCover>,
-    /// M3a: golden module handle → module image bytes (to reload in the worker).
-    modules: HashMap<u64, Vec<u8>>,
+    /// M3a: golden module handle → immutable module image (to reload in the
+    /// worker). Shared with the process-wide content cache and handoff snapshots
+    /// so preparing a clone never deep-copies multi-gigabyte module state.
+    modules: HashMap<u64, std::sync::Arc<[u8]>>,
     /// M3a: golden function handle → (module handle, name) — the worker re-resolves
     /// it in its reloaded module and remaps the inherited raw CUfunction handle.
     functions: HashMap<u64, (u64, String)>,
@@ -1236,7 +1238,7 @@ pub fn layout_set_share_verdict(token: u64, va: u64, ok: bool) {
 pub fn module_handoff_snapshot(
     token: u64,
 ) -> Option<(
-    Vec<(u64, Vec<u8>)>,
+    Vec<(u64, std::sync::Arc<[u8]>)>,
     Vec<FuncMeta>,
     Vec<(u64, u32)>,
     Vec<(u64, u32)>,
@@ -1468,8 +1470,157 @@ pub fn replay_lib_handles(b: &mut dyn Backend, handles: &[(u8, u16, u64, Vec<u8>
 // each function) on FIRST USE at the raw_module/raw_fn_h choke points. Empty
 // (identity) unless a Path-3 clone worker installed it via `set_handle_trans`.
 type HandleMap = std::cell::RefCell<HashMap<u64, u64>>;
-type ImageMap = std::cell::RefCell<HashMap<u64, Vec<u8>>>;
+type ImageMap = std::cell::RefCell<HashMap<u64, ModuleHandoffBytes>>;
 type MetaMap = std::cell::RefCell<HashMap<u64, (u64, String, Vec<(i32, i32)>)>>;
+
+/// Immutable bytes backing a clone worker's CUDA module handoff.
+///
+/// Owned inputs use one reference-counted allocation. Linux clone workers map
+/// the daemon's read-only handoff descriptor instead, and each module is a
+/// cheap range into that mapping. Keeping the mapping alive here is required:
+/// modules are deliberately loaded lazily, after worker startup.
+#[derive(Clone)]
+pub struct ModuleHandoffBytes {
+    storage: std::sync::Arc<ModuleHandoffStorage>,
+    start: usize,
+    len: usize,
+}
+
+enum ModuleHandoffStorage {
+    Owned(Box<[u8]>),
+    #[cfg(target_os = "linux")]
+    Mapped(ReadOnlyModuleMapping),
+}
+
+#[cfg(target_os = "linux")]
+struct ReadOnlyModuleMapping {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: the mapping is immutable (`PROT_READ`) and remains valid until the
+// last Arc-backed ModuleHandoffBytes is dropped. Sharing read-only slices across
+// worker serving threads cannot introduce aliasing writes.
+#[cfg(target_os = "linux")]
+unsafe impl Send for ReadOnlyModuleMapping {}
+// SAFETY: see the Send justification above; no API exposes a mutable pointer.
+#[cfg(target_os = "linux")]
+unsafe impl Sync for ReadOnlyModuleMapping {}
+
+#[cfg(target_os = "linux")]
+impl Drop for ReadOnlyModuleMapping {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` and `len` are exactly the successful mmap result and
+        // are unmapped once, when the final Arc owner is released.
+        unsafe {
+            libc::munmap(self.ptr.as_ptr().cast(), self.len);
+        }
+    }
+}
+
+impl ModuleHandoffBytes {
+    pub fn from_owned(bytes: Vec<u8>) -> Self {
+        let bytes = bytes.into_boxed_slice();
+        let len = bytes.len();
+        Self {
+            storage: std::sync::Arc::new(ModuleHandoffStorage::Owned(bytes)),
+            start: 0,
+            len,
+        }
+    }
+
+    /// Map an immutable regular file read-only. The file descriptor may be
+    /// closed after this returns; the mapping owns the kernel reference.
+    ///
+    /// # Safety
+    ///
+    /// The file must not be truncated or modified for the lifetime of this
+    /// value or any slices cloned from it.
+    #[cfg(target_os = "linux")]
+    pub unsafe fn map_read_only(file: &std::fs::File, len: usize) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file()
+            || len == 0
+            || len > isize::MAX as usize
+            || metadata.len() < len as u64
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "CUDA module handoff mapping has invalid size",
+            ));
+        }
+        // SAFETY: the descriptor is a validated regular file at least `len`
+        // bytes long. The mapping is read-only/private and checked for failure.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        let Some(ptr) = std::ptr::NonNull::new(ptr.cast::<u8>()) else {
+            // SAFETY: mmap reported success, so release its exact result before
+            // rejecting an address that cannot back a NonNull slice.
+            unsafe { libc::munmap(ptr, len) };
+            return Err(std::io::Error::other(
+                "CUDA module handoff mmap returned null",
+            ));
+        };
+        Ok(Self {
+            storage: std::sync::Arc::new(ModuleHandoffStorage::Mapped(ReadOnlyModuleMapping {
+                ptr,
+                len,
+            })),
+            start: 0,
+            len,
+        })
+    }
+
+    /// Return a cheap, bounds-checked view into the same immutable storage.
+    pub fn slice(&self, start: usize, len: usize) -> Option<Self> {
+        let end = start.checked_add(len)?;
+        if end > self.len {
+            return None;
+        }
+        Some(Self {
+            storage: self.storage.clone(),
+            start: self.start.checked_add(start)?,
+            len,
+        })
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        #[cfg(target_os = "linux")]
+        let all: &[u8] = match self.storage.as_ref() {
+            ModuleHandoffStorage::Owned(bytes) => bytes,
+            ModuleHandoffStorage::Mapped(mapping) => {
+                // SAFETY: the mapping remains live through `self.storage`, is
+                // immutable, and its length was validated before construction.
+                unsafe { std::slice::from_raw_parts(mapping.ptr.as_ptr(), mapping.len) }
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let all: &[u8] = {
+            let ModuleHandoffStorage::Owned(bytes) = self.storage.as_ref();
+            bytes
+        };
+        &all[self.start..self.start + self.len]
+    }
+}
+
+impl AsRef<[u8]> for ModuleHandoffBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
 thread_local! {
     static FUNC_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
     static MOD_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
@@ -1667,6 +1818,25 @@ pub fn set_handle_trans(
     streams: Vec<(u64, u64)>,
     events: Vec<(u64, u64)>,
 ) {
+    set_shared_handle_trans(
+        mod_images
+            .into_iter()
+            .map(|(handle, image)| (handle, ModuleHandoffBytes::from_owned(image)))
+            .collect(),
+        func_meta,
+        streams,
+        events,
+    );
+}
+
+/// Install handle reconstruction without copying module images. Each image may
+/// be a range of one shared read-only handoff mapping.
+pub fn set_shared_handle_trans(
+    mod_images: Vec<(u64, ModuleHandoffBytes)>,
+    func_meta: Vec<FuncMeta>,
+    streams: Vec<(u64, u64)>,
+    events: Vec<(u64, u64)>,
+) {
     fn put_h(cell: &'static std::thread::LocalKey<HandleMap>, v: Vec<(u64, u64)>) {
         cell.with(|m| {
             let mut m = m.borrow_mut();
@@ -1741,20 +1911,30 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
                 .as_ref()
                 .and_then(|m| m.get(&golden).cloned())
         });
-    let Some(mut image) = image else {
+    let Some(image) = image else {
         return golden;
     };
     // Binary images (ELF cubin / fatbin) must reload BYTE-IDENTICAL to what the
     // golden loaded — appending anything diverges from the proven-loadable bytes
     // (sm90 fatbins failed 209 with a spurious trailing byte). Only PTX, which
     // cuModuleLoadData reads as a C string, needs a trailing NUL.
-    let is_elf = image.starts_with(&[0x7f, b'E', b'L', b'F']);
-    let is_fatbin = image.len() >= 4
-        && u32::from_le_bytes([image[0], image[1], image[2], image[3]]) == 0xba55ed50;
-    if !is_elf && !is_fatbin && image.last() != Some(&0) {
-        image.push(0);
-    }
-    match b.module_load_data(&image) {
+    let bytes = image.as_slice();
+    let is_elf = bytes.starts_with(&[0x7f, b'E', b'L', b'F']);
+    let is_fatbin = bytes.len() >= 4
+        && u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) == 0xba55ed50;
+    let nul_terminated;
+    let load_bytes = if !is_elf && !is_fatbin && bytes.last() != Some(&0) {
+        nul_terminated = {
+            let mut copy = Vec::with_capacity(bytes.len() + 1);
+            copy.extend_from_slice(bytes);
+            copy.push(0);
+            copy
+        };
+        nul_terminated.as_slice()
+    } else {
+        bytes
+    };
+    match b.module_load_data(load_bytes) {
         Ok(w) => {
             MOD_TRANS.with(|m| {
                 m.borrow_mut().insert(golden, w);
@@ -1772,15 +1952,19 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
                 std::sync::atomic::AtomicU64::new(0);
             let n = RELOAD_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 8 {
-                let head: Vec<String> = image.iter().take(12).map(|b| format!("{b:02x}")).collect();
+                let head: Vec<String> = load_bytes
+                    .iter()
+                    .take(12)
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
                 eprintln!(
                     "[M3a-lazy] module reload failed: e={e} len={} elf={is_elf} fatbin={is_fatbin} head={}",
-                    image.len(),
+                    load_bytes.len(),
                     head.join("")
                 );
                 if std::env::var_os("SMOLVM_CUDA_DUMP_FAILMOD").is_some() {
                     let p = format!("/tmp/smolvm/failmod-{golden:x}.bin");
-                    let _ = std::fs::write(&p, &image);
+                    let _ = std::fs::write(&p, load_bytes);
                     // Context health right after the failed load: a poisoned
                     // (sticky-fault) context errors on sync/alloc too; a healthy
                     // one pins the failure on cuModuleLoadData itself.
@@ -1976,10 +2160,9 @@ struct ModuleCacheKey {
     tail: [u8; 8],
 }
 
-fn module_cache() -> &'static std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<Vec<u8>>>> {
-    static C: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<Vec<u8>>>>,
-    > = std::sync::OnceLock::new();
+fn module_cache() -> &'static std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<[u8]>>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<[u8]>>>> =
+        std::sync::OnceLock::new();
     C.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -1995,7 +2178,7 @@ fn module_cache_budget() -> u64 {
     })
 }
 
-fn module_cache_put(image: &[u8]) {
+fn module_cache_put(image: std::sync::Arc<[u8]>) {
     if image.len() < 64 {
         return;
     }
@@ -2005,16 +2188,15 @@ fn module_cache_put(image: &[u8]) {
         return; // over budget: first-come wins; the big early fatbins matter most
     }
     let key = ModuleCacheKey {
-        fnv: fnv64(image),
+        fnv: fnv64(&image),
         len: image.len() as u64,
         head: image[..8].try_into().unwrap(),
         tail: image[image.len() - 8..].try_into().unwrap(),
     };
-    c.entry(key)
-        .or_insert_with(|| std::sync::Arc::new(image.to_vec()));
+    c.entry(key).or_insert(image);
 }
 
-fn module_cache_get(key: &ModuleCacheKey) -> Option<std::sync::Arc<Vec<u8>>> {
+fn module_cache_get(key: &ModuleCacheKey) -> Option<std::sync::Arc<[u8]>> {
     module_cache().lock().unwrap().get(key).cloned()
 }
 
@@ -3265,7 +3447,7 @@ fn worker_module_take(raw: u64) -> bool {
 /// passed RAW GOLDEN HANDLES to the driver — launch-time "invalid argument"
 /// at best, a SIGSEGV inside `cuModuleGetFunction` (foreign-handle deref) at
 /// worst: the intermittent per-clone worker crash loop.
-static MOD_IMAGES_GLOBAL: std::sync::Mutex<Option<HashMap<u64, Vec<u8>>>> =
+static MOD_IMAGES_GLOBAL: std::sync::Mutex<Option<HashMap<u64, ModuleHandoffBytes>>> =
     std::sync::Mutex::new(None);
 #[allow(clippy::type_complexity)]
 static FUNC_META_GLOBAL: std::sync::Mutex<Option<HashMap<u64, (u64, String, Vec<(i32, i32)>)>>> =
@@ -3865,14 +4047,15 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             let raw = b.module_load_data(&image)?;
             worker_module_register(raw);
             sess.owned_modules.insert(raw);
+            let image: std::sync::Arc<[u8]> = image.into();
             // Feed the process-wide image cache so later replicas can load by
             // hash without re-shipping the bytes (LibCall 6/1).
-            module_cache_put(&image);
+            module_cache_put(image.clone());
             // M3a: keep the image so a Path-3 clone worker can reload the module in
             // its own context and remap this inherited handle.
             if path3_enabled() {
                 let mut layout = sess.golden_layout.lock().unwrap();
-                layout.modules.insert(raw, image.clone());
+                layout.modules.insert(raw, image);
                 layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
             }
             Ok(Response::Handle(raw))
@@ -4466,7 +4649,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     sess.owned_modules.insert(raw);
                     if path3_enabled() {
                         let mut layout = sess.golden_layout.lock().unwrap();
-                        layout.modules.insert(raw, image.to_vec());
+                        layout.modules.insert(raw, image.clone());
                         layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
                     }
                     return Ok(Response::LibResult(0, raw.to_le_bytes().to_vec()));
@@ -5129,6 +5312,31 @@ mod tests {
     use super::*;
     use crate::client::Client;
     use std::io::{Read, Write};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_module_ranges_keep_the_read_only_mapping_alive() {
+        use std::io::Write as _;
+        use std::os::fd::FromRawFd as _;
+
+        let name = std::ffi::CString::new("smolvm-module-mapping-test").unwrap();
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(b"0123456789").unwrap();
+        let range = {
+            // SAFETY: the test never changes the memfd after mapping it.
+            let mapping = unsafe { ModuleHandoffBytes::map_read_only(&file, 10) }.unwrap();
+            assert!(matches!(
+                mapping.storage.as_ref(),
+                ModuleHandoffStorage::Mapped(_)
+            ));
+            mapping.slice(3, 4).unwrap()
+        };
+        drop(file);
+        assert_eq!(range.as_slice(), b"3456");
+        assert!(range.slice(4, 1).is_none());
+    }
 
     #[test]
     fn replayed_vmm_access_preserves_only_shared_intersections() {
@@ -5909,9 +6117,10 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let layout: Arc<LayoutCell> = Arc::new(Mutex::new(GoldenLayout::default()));
+        let image: Arc<[u8]> = vec![1, 2, 3, 4].into();
         {
             let mut state = layout.lock().unwrap();
-            state.modules.insert(0xCAFE, vec![1, 2, 3, 4]);
+            state.modules.insert(0xCAFE, image.clone());
             state.handoff_revision = 7;
         }
         let primary = 0xA3A3_0000_0000_0001;
@@ -5928,7 +6137,10 @@ mod tests {
 
         for token in [primary, alias] {
             let (modules, ..) = module_handoff_snapshot(token).unwrap();
-            assert_eq!(modules, vec![(0xCAFE, vec![1, 2, 3, 4])]);
+            assert_eq!(modules.len(), 1);
+            assert_eq!(modules[0].0, 0xCAFE);
+            assert_eq!(modules[0].1.as_ref(), &[1, 2, 3, 4]);
+            assert!(Arc::ptr_eq(&modules[0].1, &image));
             assert!(layout_handoff_snapshot(token).unwrap().1.is_empty());
         }
         assert!(layout_handoff_same_process(primary, alias));
@@ -5964,7 +6176,7 @@ mod tests {
             .lock()
             .unwrap()
             .modules
-            .insert(0xBEEF, vec![4, 3, 2, 1]);
+            .insert(0xBEEF, vec![4, 3, 2, 1].into());
         let token = 0xA5A5_0000_0000_0001;
         layout_handoff_register(&layout, token);
 
@@ -5976,7 +6188,9 @@ mod tests {
             vec![(0x4000, 0x2000)]
         );
         let (modules, ..) = module_handoff_snapshot(token).unwrap();
-        assert_eq!(modules, vec![(0xBEEF, vec![4, 3, 2, 1])]);
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].0, 0xBEEF);
+        assert_eq!(modules[0].1.as_ref(), &[4, 3, 2, 1]);
         assert!(release_metadata_only_layout(token));
         assert!(layout_handoff_snapshot(token).is_none());
     }
