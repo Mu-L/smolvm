@@ -3063,6 +3063,7 @@ dependencies = [
  "utoipa-axum",
  "utoipa-swagger-ui",
  "windows-sys 0.60.2",
+ "wiremock",
  "zeroize",
 ]
 
@@ -3079,6 +3080,7 @@ dependencies = [
  "ruzstd",
  "serde",
  "serde_json",
+ "smolvm-oci-layer",
  "smolvm-protocol",
  "tar",
  "tempfile",
@@ -3143,6 +3145,19 @@ name = "smolvm-nvml-shim"
 version = "1.7.2"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "smolvm-oci-layer"
+version = "1.7.2"
+dependencies = [
+ "flate2",
+ "libc",
+ "ruzstd",
+ "tar",
+ "tempfile",
+ "tracing",
+ "zstd",
 ]
 
 [[package]]

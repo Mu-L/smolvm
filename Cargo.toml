@@ -9,6 +9,7 @@ members = [
     "crates/smolvm-cudart-shim",
     "crates/smolvm-nvml-shim",
     "crates/smolvm-network",
+    "crates/smolvm-oci-layer",
     "crates/smolvm-pack",
     "crates/smolvm-protocol",
     "crates/smolvm-registry",
@@ -128,6 +129,7 @@ tempfile = "3"
 smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.7.2" }
 regex = "1"
 tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"
 
 [build-dependencies]
 pkg-config = "0.3"
