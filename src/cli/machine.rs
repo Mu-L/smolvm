@@ -3130,24 +3130,30 @@ impl CreateCmd {
         // `manifest` is moved into `params`; the disks are seeded from them after
         // extraction below, or the machine boots the bare agent-rootfs with no
         // /bin/sh (mirrors pack_run + the serve API create path).
-        let vm_seed: Option<(Option<String>, Option<String>, Option<u64>)> =
-            if manifest.mode == smolvm_pack::format::PackMode::Vm {
-                Some((
-                    manifest
-                        .assets
-                        .overlay_template
-                        .as_ref()
-                        .map(|t| t.path.clone()),
-                    manifest
-                        .assets
-                        .storage_template
-                        .as_ref()
-                        .map(|t| t.path.clone()),
-                    manifest.assets.overlay_logical_size,
-                ))
-            } else {
-                None
-            };
+        struct VmModeSeed {
+            overlay_template: Option<String>,
+            storage_template: Option<String>,
+            overlay_logical_size: Option<u64>,
+            storage_logical_size: Option<u64>,
+        }
+        let vm_seed = if manifest.mode == smolvm_pack::format::PackMode::Vm {
+            Some(VmModeSeed {
+                overlay_template: manifest
+                    .assets
+                    .overlay_template
+                    .as_ref()
+                    .map(|t| t.path.clone()),
+                storage_template: manifest
+                    .assets
+                    .storage_template
+                    .as_ref()
+                    .map(|t| t.path.clone()),
+                overlay_logical_size: manifest.assets.overlay_logical_size,
+                storage_logical_size: manifest.assets.storage_logical_size,
+            })
+        } else {
+            None
+        };
 
         // Resolve the canonical path for storage in VmRecord.
         let canonical_path = sidecar_path
@@ -3323,19 +3329,36 @@ impl CreateCmd {
             }
 
             println!("Extracting .smolmachine assets...");
-            let result = smolvm_pack::extract::extract_sidecar(
-                sidecar_path,
-                &cache_dir,
-                &footer,
-                false,
-                false,
-            )
-            .map_err(|e| smolvm::Error::agent("extract sidecar", e.to_string()));
+            let result = if smolvm_pack::extract::shared_extract_enabled() {
+                #[cfg(target_os = "linux")]
+                {
+                    let lease = smolvm::artifact_cache::materialize_shared_pack_lease(
+                        sidecar_path,
+                        &footer,
+                        &cache_dir,
+                        false,
+                    )
+                    .map_err(|e| smolvm::Error::agent("extract sidecar (shared)", e.to_string()))?;
+                    Ok((lease.shared_dir, Some(lease.artifact_sha256)))
+                }
+                #[cfg(not(target_os = "linux"))]
+                unreachable!("shared pack extraction is Linux-only")
+            } else {
+                smolvm_pack::extract::extract_sidecar(
+                    sidecar_path,
+                    &cache_dir,
+                    &footer,
+                    false,
+                    false,
+                )
+                .map(|()| (cache_dir.clone(), None::<String>))
+                .map_err(|e| smolvm::Error::agent("extract sidecar", e.to_string()))
+            };
             // Detach unconditionally: extraction mounts the case-sensitive volume on
             // macOS even when it later fails, so the detach must run on both success
             // and failure paths to honor the "mounted iff running" invariant.
             smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
-            result?;
+            let (pack_content_dir, artifact_sha256) = result?;
 
             // VM-mode pack: seed this machine's overlay+storage disks from the
             // packed templates so a start boots the source VM's rootfs rather than
@@ -3345,7 +3368,7 @@ impl CreateCmd {
             // (Writing the resized copy onto `manager.overlay_path()` — the default
             // `.qcow2` — handed the guest raw bytes named `.qcow2`, the /bin/sh-missing
             // bug's disk counterpart.)
-            if let Some((overlay_template, storage_template, overlay_logical_size)) = &vm_seed {
+            if let Some(seed) = &vm_seed {
                 let disk_dir = manager
                     .storage_path()
                     .parent()
@@ -3353,12 +3376,16 @@ impl CreateCmd {
                     .unwrap_or_else(|| smolvm::agent::vm_data_dir(&name_for_layers));
                 smolvm::storage::seed_vm_mode_disks(
                     &disk_dir,
-                    &cache_dir,
-                    overlay_template.as_deref(),
-                    storage_template.as_deref(),
-                    *overlay_logical_size,
-                    params.overlay_gb,
-                    params.storage_gb,
+                    &pack_content_dir,
+                    smolvm::storage::VmModeDiskSeedSpec {
+                        artifact_sha256: artifact_sha256.as_deref(),
+                        overlay_template: seed.overlay_template.as_deref(),
+                        storage_template: seed.storage_template.as_deref(),
+                        overlay_logical_size: seed.overlay_logical_size,
+                        storage_logical_size: seed.storage_logical_size,
+                        overlay_gb: params.overlay_gb,
+                        storage_gb: params.storage_gb,
+                    },
                 )
                 .map_err(|e| smolvm::Error::agent("seed VM-mode disks", e.to_string()))?;
             }
