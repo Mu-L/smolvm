@@ -871,6 +871,38 @@ const ARCHIVE_CONFIG_FILE: &str = "config.json";
 /// Marker written once a flatten completes, so restarts reuse it.
 const ARCHIVE_EXTRACTED_MARKER: &str = ".extracted";
 
+/// Env var to override where archive staging spills its scratch. Point it at a
+/// mounted volume with more room than the storage disk, or elsewhere entirely.
+const ARCHIVE_SCRATCH_DIR_ENV: &str = "SMOLVM_ARCHIVE_SCRATCH_DIR";
+
+/// Scratch space for archive staging. Defaults to the storage disk because the
+/// guest's `/tmp` is a tmpfs sized from VM RAM, so multi-GiB scratch — crane's
+/// stdin spool, the decompressed copy of a compressed archive — must land on
+/// the machine's disk instead: a 10 GB `docker save` archive would otherwise
+/// fill `/tmp` while `/storage` sits idle (#955). Precedence:
+///   1. `SMOLVM_ARCHIVE_SCRATCH_DIR`, when set to a dir that can be created;
+///   2. `/storage/tmp`, the storage disk;
+///   3. the default temp dir, when the storage disk is absent (host-side unit
+///      tests).
+fn archive_scratch_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var(ARCHIVE_SCRATCH_DIR_ENV) {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            let p = PathBuf::from(dir);
+            if std::fs::create_dir_all(&p).is_ok() {
+                return p;
+            }
+            warn!(dir = %p.display(), "{ARCHIVE_SCRATCH_DIR_ENV} unusable, falling back to the storage disk");
+        }
+    }
+    let dir = Path::new(STORAGE_ROOT).join("tmp");
+    if std::fs::create_dir_all(&dir).is_ok() {
+        dir
+    } else {
+        std::env::temp_dir()
+    }
+}
+
 /// If `packed_dir` is a staged local image archive (it contains `archive.tar`),
 /// flatten it once into a rootfs on the storage disk and return that directory
 /// (holding `0000_rootfs/` + `config.json`). Returns `None` for an ordinary
@@ -971,7 +1003,7 @@ where
     // streaming decompressor into a subprocess's stdin. The guest ships no zstd
     // tool, so decompression is done in-process.
     let mut reader = decompress_layer_reader(file)?;
-    let mut tmp = tempfile::NamedTempFile::new()
+    let mut tmp = tempfile::NamedTempFile::new_in(archive_scratch_dir())
         .map_err(|e| StorageError::new(format!("failed to create temp file: {e}")))?;
     copy_with_progress(
         &mut reader,
@@ -1157,6 +1189,10 @@ where
     let mut crane = Command::new("crane");
     crane
         .args(["export", "-", "-"])
+        // crane spools the stdin tarball to a temp file before flattening it;
+        // point that at the storage disk so an archive bigger than the RAM-sized
+        // /tmp tmpfs doesn't fail with a full filesystem (#955).
+        .env("TMPDIR", archive_scratch_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // Capture (don't discard) crane's stderr so a failure reports the REAL
@@ -5202,6 +5238,35 @@ mod tests {
         );
 
         std::env::remove_var(guest_env::DNS);
+    }
+
+    #[test]
+    fn archive_scratch_dir_honors_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        // A dir that doesn't exist yet, to prove it's created on demand.
+        let target = base.path().join("scratch");
+        std::env::set_var(ARCHIVE_SCRATCH_DIR_ENV, &target);
+
+        assert_eq!(archive_scratch_dir(), target);
+        assert!(target.is_dir(), "override dir should be created");
+
+        std::env::remove_var(ARCHIVE_SCRATCH_DIR_ENV);
+    }
+
+    #[test]
+    fn archive_scratch_dir_ignores_blank_override() {
+        // A blank/whitespace override is treated as unset, not as "use CWD".
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var(ARCHIVE_SCRATCH_DIR_ENV, "   ");
+
+        // Without a storage disk on the host, this falls through to the OS temp
+        // dir — never the override, never an empty path.
+        let dir = archive_scratch_dir();
+        assert!(dir.is_absolute() && dir.is_dir());
+        assert_ne!(dir.as_os_str(), "   ");
+
+        std::env::remove_var(ARCHIVE_SCRATCH_DIR_ENV);
     }
 
     #[test]
