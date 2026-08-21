@@ -129,6 +129,8 @@ pub struct MachineRegistration {
     pub manager: AgentManager,
     /// Host mounts to configure.
     pub mounts: Vec<MountSpec>,
+    /// Remote volumes (s3:// or rclone remotes) to mount in the workload.
+    pub remote_volumes: Vec<crate::remote_volume::RemoteVolume>,
     /// Port mappings to configure.
     pub ports: Vec<PortSpec>,
     /// VM resources to configure.
@@ -919,6 +921,10 @@ impl ApiState {
         record.env = reg.env;
         record.workdir = reg.workdir;
         record.secret_refs = reg.secret_refs.clone();
+        record.remote_volumes = reg.remote_volumes.clone();
+        record
+            .validate_remote_volumes()
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
         // A registry image with no network can never be pulled (the guest runs
         // the pull), so reject with a 400 here instead of persisting a machine
@@ -1394,6 +1400,17 @@ async fn relaunch_image_workload(
         crate::api::handlers::record_secret_refs_env(entry)
             .map_err(|e| crate::Error::agent("resolve workload secrets", format!("{e:?}")))?,
     ));
+    // Remote volumes mount inside the workload container; build the mount script
+    // here and let the agent run it ahead of the image-resolved command, so a
+    // service image's own entrypoint is preserved rather than clobbered.
+    let remote_volume_mount = if record.remote_volumes.is_empty() {
+        None
+    } else {
+        Some(crate::remote_volume::mount_script(
+            &record.remote_volumes,
+            &env,
+        )?)
+    };
     let workdir = record.workdir.clone();
     let user = record.user.clone();
     let mounts_config = {
@@ -1422,7 +1439,8 @@ async fn relaunch_image_workload(
             .with_workdir(workdir)
             .with_user(user)
             .with_mounts(mounts_config)
-            .with_persistent_overlay(Some(overlay_id));
+            .with_persistent_overlay(Some(overlay_id))
+            .with_remote_volume_mount(remote_volume_mount);
         c.run_container_detached(config).map(|_| ())
     })
     .await

@@ -452,6 +452,10 @@ pub struct RunConfig {
     /// Run as an unprivileged container (restricted caps, ro cgroup, no extra
     /// tmpfs). Default false = "VM-grade" (the microVM is the boundary).
     pub unprivileged: bool,
+    /// Remote-volume mount script to run inside the workload container before
+    /// its (image-resolved) command. Set by the workload launcher; the agent
+    /// wraps the resolved command so the image's real entrypoint still runs.
+    pub remote_volume_mount: Option<String>,
 }
 
 impl RunConfig {
@@ -473,7 +477,14 @@ impl RunConfig {
             persistent_overlay_id: None,
             stdin: None,
             unprivileged: false,
+            remote_volume_mount: None,
         }
+    }
+
+    /// Set the remote-volume mount script run inside the workload container.
+    pub fn with_remote_volume_mount(mut self, script: Option<String>) -> Self {
+        self.remote_volume_mount = script;
+        self
     }
 
     /// Set environment variables.
@@ -1577,6 +1588,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: config.stdin,
             background: false,
+            remote_volume_mount: None,
         })?;
 
         expect_completed(resp, "run command")
@@ -1603,6 +1615,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: true,
+            remote_volume_mount: None,
         })?;
 
         let (exit_code, stdout, _stderr) = expect_completed(resp, "run background")?;
@@ -1646,6 +1659,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: false,
+            remote_volume_mount: None,
         })?;
 
         collect_exec_events(self, "run streaming", on_event)
@@ -1683,6 +1697,7 @@ impl AgentClient {
                 persistent_overlay_id: config.persistent_overlay_id,
                 stdin_data: None,
                 background: false,
+                remote_volume_mount: None,
             },
             tty,
             "run interactive",
@@ -1721,6 +1736,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: false,
+            remote_volume_mount: config.remote_volume_mount,
         })?;
         let resp = loop {
             match self.receive()? {
@@ -1956,6 +1972,7 @@ impl AgentClient {
                 persistent_overlay_id: config.persistent_overlay_id,
                 stdin_data: None,
                 background: false,
+                remote_volume_mount: None,
             },
             input,
             on_output,
