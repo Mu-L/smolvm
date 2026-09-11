@@ -316,6 +316,13 @@ fn main() {
         setup_gpu_dev_nodes();
     }
 
+    // Deliberately NOT under the GPU condition above: nesting and the GPU are
+    // independent, and gating this on --gpu would leave a --nested machine with
+    // no /dev/kvm. Cheap when unused — it returns immediately unless the kernel
+    // registered KVM.
+    #[cfg(target_os = "linux")]
+    setup_kvm_dev_node();
+
     // Set up persistent rootfs overlay (if /dev/vdb exists).
     // This does overlayfs + pivot_root before anything else touches the filesystem.
     setup_persistent_rootfs();
@@ -963,6 +970,46 @@ fn setup_gpu_dev_nodes() {
                 libc::makedev(major, minor),
             );
         }
+    }
+}
+
+/// Create `/dev/kvm` when the guest kernel registered it.
+///
+/// With nested virtualization the kernel brings KVM up and registers its misc
+/// device, but a workload container's `/dev` is not devtmpfs, so no node ever
+/// appears and anything needing a hypervisor fails with the misleading "KVM not
+/// available. Ensure KVM kernel module is loaded" -- the module IS there. Same
+/// gap the DRM nodes above work around, and the minor is read the same way.
+#[cfg(target_os = "linux")]
+fn setup_kvm_dev_node() {
+    if std::path::Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let Ok(misc) = std::fs::read_to_string("/proc/misc") else {
+        return; // no kernel support: nothing to expose, and that is not an error
+    };
+    // /proc/misc lines are "<minor> <name>"; KVM is always misc major 10.
+    let Some(minor) = misc.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let minor = parts.next()?.parse::<u32>().ok()?;
+        (parts.next()? == "kvm").then_some(minor)
+    }) else {
+        return;
+    };
+    let Ok(path) = std::ffi::CString::new("/dev/kvm") else {
+        return;
+    };
+    // SAFETY: mknod a character device with KVM's fixed major and the minor the
+    // kernel just reported. 0666 so an unprivileged workload can use it too.
+    let rc = unsafe {
+        libc::mknod(
+            path.as_ptr(),
+            libc::S_IFCHR | 0o666,
+            libc::makedev(10, minor),
+        )
+    };
+    if rc == 0 {
+        tracing::info!(minor, "created /dev/kvm for nested virtualization");
     }
 }
 
@@ -3834,6 +3881,7 @@ fn write_oci_bundle(
     // storage::run_command(). Mirror that path's GPU wiring so `-i`/`-t`
     // shells see /dev/dri when the VM was started with --gpu.
     spec.add_gpu_devices_if_available();
+    spec.add_kvm_device_if_available();
 
     if container_init {
         const INIT_SOURCE: &str = "/usr/local/bin/smolvm-agent";
@@ -5055,6 +5103,7 @@ fn spawn_interactive_command(
     let identity = oci::resolve_process_identity(rootfs_path, user)?;
     let mut spec = oci::OciSpec::new(command, env, workdir_str, false, &identity, unprivileged);
     spec.add_gpu_devices_if_available();
+    spec.add_kvm_device_if_available();
 
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = storage::volume_bind_source(tag);
