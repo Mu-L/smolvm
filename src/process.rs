@@ -2787,7 +2787,7 @@ pub fn stop_vm_process(
 /// Poll for process exit with aggressive-then-backoff strategy.
 ///
 /// Returns `Some(exit_code)` if the process exits within the timeout.
-fn poll_for_exit(pid: Pid, timeout: Duration) -> Option<i32> {
+pub(crate) fn poll_for_exit(pid: Pid, timeout: Duration) -> Option<i32> {
     let start = Instant::now();
     let mut poll_count: u32 = 0;
 
